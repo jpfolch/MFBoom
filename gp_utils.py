@@ -115,11 +115,11 @@ class BoTorchGP():
 
             if ((epoch + 1) % 10 == 0) & (verbose):
                 print(
-                    f"Epoch {epoch+1:>3}/{num_of_epochs} - Loss: {loss.item():>4.3f} "
-                    f"outputscale: {self.model.covar_module.outputscale.item():4.3f} "
-                    f"lengthscale: {self.model.covar_module.base_kernel.lengthscale.detach():>4.3f} " 
-                    f"noise: {self.model.likelihood.noise.item():>4.3f} " 
-                    f"mean constant: {self.model.mean_module.constant.item():>4.3f}"
+                    f"Epoch {epoch+1:>3}/{num_of_epochs} - Loss: {loss.item()} "
+                    f"outputscale: {self.model.covar_module.outputscale.item()} "
+                    f"lengthscale: {self.model.covar_module.base_kernel.lengthscale.detach()} " 
+                    f"noise: {self.model.likelihood.noise.item()} " 
+                    f"mean constant: {self.model.mean_module.constant.item()}"
          )
     
     def current_hyperparams(self):
