@@ -22,6 +22,7 @@ class BoTorchGP():
         # initialize if we should set contrainst and if we have a multi-dimensional lengthscale
         self.constraints_set = False
         self.lengthscale_dim = lengthscale_dim
+        self.model = None
         
     def fit_model(self, train_x, train_y, train_hyperparams = False, previous_hyperparams = None):
         '''
