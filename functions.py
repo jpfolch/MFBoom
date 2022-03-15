@@ -4,7 +4,7 @@ import torch
 
 class BraninFunction():
     def __init__(self):
-        self. dim = 2
+        self.dim = 2
         self.optimum = 1.0473939180374146
         self.num_of_fidelities = 2
         self.name = 'Branin2D'
@@ -42,6 +42,99 @@ class BraninFunction():
 
             return -(s1 + s2) / 60
     
+
+class CurrinExp2D():
+    def __init__(self):
+        self.dim = 2
+        self.optimum = 1.379872441291809
+        self.num_of_fidelities = 2
+        self.name = 'CurrinExp2D'
+        self.require_transform = False
+        self.fidelity_costs = [1, 1]
+    
+    def draw_new_function(self):
+        pass
+
+    def evaluate_target(self, x1, x2):
+        prod1 = 1 - np.exp(- 1 / (2 * (x2 + 1e-5)))
+        prod2 = (2300 * x1**3 + 1900 * x1**2 + 2092 * x1 + 60) / (100 * x1**3 + 500 * x1**2 + 4 * x1 + 20)
+
+        return prod1 * prod2 / 10
+    
+    def query_function_torch(self, x):
+        x1 = x[:, 0]
+        x2 = x[:, 1]
+
+        prod1 = 1 - torch.exp(- 1 / (2 * (x2 + 1e-5)))
+        prod2 = (2300 * x1**3 + 1900 * x1**2 + 2092 * x1 + 60) / (100 * x1**3 + 500 * x1**2 + 4 * x1 + 20)
+        return prod1 * prod2 / 10
+
+    def evaluate(self, x, m):
+
+        assert m in [0, 1], 'CurrinExp2D only has two fidelities'
+
+        x1 = x[:, 0]
+        x2 = x[:, 1]
+
+        if m == 0:
+            return self.evaluate_target(x1, x2)
+        
+        elif m == 1:
+            s1 = self.evaluate_target(x1 + 0.05, x2 + 0.05)
+            s2 = self.evaluate_target(x1 + 0.05, np.maximum(0, x2 - 0.05))
+            s3 = self.evaluate_target(x1 - 0.05, x2 + 0.05)
+            s4 = self.evaluate_target(x1 - 0.05, np.maximum(0, x2 - 0.05))
+            return (s1 + s2 + s3 + s4) / 4
+
+    def eval_times(self, M):
+        # returns evaluation times for each query
+        times = []
+        for m in M:
+            if m == 0:
+                times.append(3)
+            else:
+                times.append(1)
+        return np.array(times).reshape(-1, 1)
+
+class BadCurrinExp2D():
+    def __init__(self):
+        self.dim = 2
+        self.optimum = 1.379872441291809
+        self.num_of_fidelities = 2
+        self.name = 'BadCurrinExp2D'
+        self.require_transform = False
+        self.fidelity_costs = [1, 1]
+    
+    def draw_new_function(self):
+        pass
+
+    def evaluate_target(self, x1, x2):
+        prod1 = 1 - np.exp(- 1 / (2 * (x2 + 1e-5)))
+        prod2 = (2300 * x1**3 + 1900 * x1**2 + 2092 * x1 + 60) / (100 * x1**3 + 500 * x1**2 + 4 * x1 + 20)
+
+        return prod1 * prod2 / 10
+    
+    def query_function_torch(self, x):
+        x1 = x[:, 0]
+        x2 = x[:, 1]
+
+        prod1 = 1 - torch.exp(- 1 / (2 * (x2 + 1e-5)))
+        prod2 = (2300 * x1**3 + 1900 * x1**2 + 2092 * x1 + 60) / (100 * x1**3 + 500 * x1**2 + 4 * x1 + 20)
+        return prod1 * prod2 / 10
+
+    def evaluate(self, x, m):
+
+        assert m in [0, 1], 'CurrinExp2D only has two fidelities'
+
+        x1 = x[:, 0]
+        x2 = x[:, 1]
+
+        if m == 0:
+            return self.evaluate_target(x1, x2)
+        
+        elif m == 1:
+            return - self.evaluate_target(x1, x2)
+
     def eval_times(self, M):
         # returns evaluation times for each query
         times = []
@@ -54,10 +147,7 @@ class BraninFunction():
 
 def find_optimum(func, n_starts = 25, n_epochs = 100):
     # find dimension
-    if func.x_dim is not None:
-        dim = func.x_dim + func.t_dim
-    else:
-        dim = func.t_dim
+    dim = func.dim
     # define bounds
     bounds = torch.stack([torch.zeros(dim), torch.ones(dim)])
     # random multistart
@@ -88,6 +178,6 @@ def find_optimum(func, n_starts = 25, n_epochs = 100):
 
 # this last part is used to find the optimum of functions using gradient methods, if optimum is not available online
 if __name__ == '__main__':
-    func = BraninFunction()
+    func = CurrinExp2D()
     best_input, best_eval = find_optimum(func, n_starts = 100000, n_epochs = 1000)
     print(float(best_eval.detach()))
