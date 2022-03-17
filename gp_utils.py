@@ -76,30 +76,24 @@ class BoTorchGP():
         else:
             self.noise_constraint = False
 
-    def optim_hyperparams(self, num_of_epochs = 500, verbose = False):
+    def optim_hyperparams(self, num_of_epochs = 25, verbose = False):
         '''
         We can optimize the hype-parameters by maximizing the marginal log-likelihood.
         '''
-        # set constraints if there are any
-        if self.constraints_set is True:
-            if verbose:
-                print('Setting Constraints...')
-                print(f'lengthscale lb {self.lengthscale_lb} : lengthscale ub {self.lengthscale_ub}')
-                print(f'outputscale lb {self.outputscale_lb} : outputscale ub {self.outputscale_ub}')
-                print(f'mean constant lb {self.mean_constant_lb} : mean constant ub {self.mean_constant_ub}')
-            # for lengthscale
-            prior_lengthscale = SmoothedBoxPrior(self.lengthscale_lb, self.lengthscale_ub, 0.001)
-            self.model.covar_module.base_kernel.register_prior('Smoothed Box Prior', prior_lengthscale, "lengthscale")
-            # for outputscale
-            prior_outputscale = SmoothedBoxPrior(self.outputscale_lb, self.outputscale_ub, 0.001)
-            self.model.covar_module.register_prior('Smoothed Box Prior', prior_outputscale, "outputscale")
-            # for mean constant
-            prior_constant = SmoothedBoxPrior(self.mean_constant_lb, self.mean_constant_ub, 0.001)
-            self.model.mean_module.register_prior('Smoothed Box Prior', prior_constant, "constant")
-
-            if self.noise_constraint:
-                prior_noise = SmoothedBoxPrior(self.noise_lb, self.noise_ub, 0.001)
-                self.model.likelihood.register_prior('Smoothed Box Prior', prior_noise, "noise")
+        # for lengthscale
+        lengthscale_lb = torch.tensor([0.025 for _ in range(self.lengthscale_dim)])
+        lengthscale_ub = torch.tensor([0.6 for _ in range(self.lengthscale_dim)])
+        prior_lengthscale = SmoothedBoxPrior(lengthscale_lb, lengthscale_ub, 0.1)
+        self.model.covar_module.base_kernel.register_prior('Smoothed Box Prior', prior_lengthscale, "lengthscale")
+        # for outputscale
+        prior_outputscale = SmoothedBoxPrior(0.2, 2, 0.1)
+        self.model.covar_module.register_prior('Smoothed Box Prior', prior_outputscale, "outputscale")
+        # for mean constant
+        prior_constant = SmoothedBoxPrior(-1, 1, 0.1)
+        self.model.mean_module.register_prior('Smoothed Box Prior', prior_constant, "constant")
+        # for noise constraint
+        prior_noise = SmoothedBoxPrior(1e-5, 0.2, 0.1)
+        self.model.likelihood.register_prior('Smoothed Box Prior', prior_noise, "noise")
         
         # define optimiser
         optimiser = Adam([{'params': self.model.parameters()}], lr=0.01)
