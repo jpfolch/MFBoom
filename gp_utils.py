@@ -19,6 +19,8 @@ class BoTorchGP():
         # initialize kernel
         if kernel == None:
             self.kernel = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims = lengthscale_dim))
+        else:
+            self.kernel = kernel
         # initialize if we should set contrainst and if we have a multi-dimensional lengthscale
         self.constraints_set = False
         self.lengthscale_dim = lengthscale_dim
