@@ -1,8 +1,6 @@
 import numpy as np
 import torch
 from gp_utils import BoTorchGP
-from botorch.acquisition.analytic import ExpectedImprovement, ProbabilityOfImprovement
-from botorch.optim.initializers import initialize_q_batch_nonneg
 import sobol_seq
 from gpytorch.kernels import MaternKernel, ScaleKernel
 
@@ -31,13 +29,13 @@ class mfLiveBatch():
         # multifidelity parameters
         self.num_of_fidelities = self.env.num_of_fidelities
         if fidelity_thresholds is None:
-            self.fidelity_thresholds = [0.1 for _ in range(self.num_of_fidelities)]
-            self.fidelity_thresholds_init = [0.1 for _ in range(self.num_of_fidelities)]
+            self.fidelity_thresholds = [0.01 for _ in range(self.num_of_fidelities)]
+            self.fidelity_thresholds_init = [0.01 for _ in range(self.num_of_fidelities)]
         else:
             self.fidelity_thresholds = fidelity_thresholds
             self.fidelity_thresholds_init = fidelity_thresholds.copy()
         # costs thresholds to double the fidelity thresholds
-        self.cost_thresholds = [0] + [self.env.func.expected_costs[i + 1] / self.env.func.expected_costs[i] * self.cost_budget \
+        self.cost_thresholds = [0] + [self.env.func.expected_costs[i] / self.env.func.expected_costs[i + 1] * self.cost_budget \
              for i in range(self.num_of_fidelities - 1)]
         
         # initialize count list
@@ -59,6 +57,8 @@ class mfLiveBatch():
         else:
             self.fixed_beta = True
             self.beta = beta
+        
+        self.penalization_gamma = 1
 
         # parameters of the method
         self.lipschitz_constant = [lipschitz_constant for _ in range(self.num_of_fidelities)]
@@ -220,11 +220,17 @@ class mfLiveBatch():
             self.update_model_bias(bias_update_set)
         
         # update hyperparams if needed
-        for fid in range(self.num_of_fidelities):
-            if (self.hp_update_frequency is not None) & (len(self.X[fid]) > 0):
-                if (len(self.X[fid]) % self.hp_update_frequency == 0) & (self.new_obs is not None):
-                    self.model[fid].optim_hyperparams()
-                    self.gp_hyperparams[fid] = self.model[fid].current_hyperparams()
+        if self.num_of_fidelities == 1:
+            if (self.hp_update_frequency is not None) & (len(self.X[0]) > 0):
+                if len(self.X[0]) % self.hp_update_frequency == 0:
+                    self.model[0].optim_hyperparams()
+                    self.gp_hyperparams[0] = self.model[0].current_hyperparams()
+
+        if (self.hp_update_frequency is not None) & (len(self.X[self.num_of_fidelities - 1]) > 0):
+            if len(self.X[self.num_of_fidelities - 1]) % self.hp_update_frequency == 0:
+                self.model[self.num_of_fidelities - 1].optim_hyperparams()
+                for fid2 in range(self.num_of_fidelities):
+                    self.gp_hyperparams[fid2] = self.model[self.num_of_fidelities - 1].current_hyperparams()
         # update current temperature and time
         self.current_time = self.current_time + 1
     
@@ -279,8 +285,6 @@ class mfLiveBatch():
         for i in range(self.num_of_fidelities):
             # check if we should use trained model or simply the prior
             if self.X[i] != []:
-                if self.model[i].train_x == None:
-                    print('x')
                 mean, std = self.model[i].posterior(X)
             else:
                 hypers = self.gp_hyperparams[i]
@@ -296,7 +300,7 @@ class mfLiveBatch():
             # calculate total upper confidence bound
             ucb[i, :] = mean + self.beta * std + ucb_bias
         # apply softmax transform if necessary
-        if self.soft_plus_transform: 
+        if self.soft_plus_transform:
             ucb = torch.log(1 + torch.exp(ucb))
         # penalize acquisition function, loop through batch of evaluations
         for i, penalty_point_fidelity in enumerate(zip(batch, batch_fids)):
@@ -304,13 +308,21 @@ class mfLiveBatch():
             fidelity = int(penalty_point_fidelity[1])
             # re-define penalty point as tensor
             penalty_point = torch.tensor(penalty_point)
-            # define the value that goes inside the erfc
+            # calculate mean and variance of model at penalty point
+            if self.X[fidelity] != []:
+                mean_pp, std_pp = self.model[fidelity].posterior(penalty_point)
+            else:
+                hypers = self.gp_hyperparams[fidelity]
+                mean_constant = hypers[3]
+                constant = hypers[0]
+                mean_pp, std_pp = torch.tensor(mean_constant), torch.tensor(constant)
+            # calculate values of r_j
+            r_j = (self.max_value[fidelity] - mean_pp) / self.lipschitz_constant[fidelity]
+            denominator = r_j + self.penalization_gamma * std_pp / self.lipschitz_constant[fidelity]
+            # calculate norm between x and penalty point
             norm = torch.norm(penalty_point - X, dim = 1)
-            # calculate z-value
-            z = self.lipschitz_constant[fidelity] * norm - self.max_value[fidelity] + mean
-            z = z / (std * np.sqrt(2))
             # define penaliser
-            penaliser = 0.5 * torch.erfc(-1*z)
+            penaliser = torch.min(norm / denominator, torch.tensor(1))
             # penalise ucb
             ucb[fidelity, :] = ucb[fidelity, :].clone() * penaliser
         # return acquisition function
@@ -391,7 +403,7 @@ class mfLiveBatch():
         
         return new_X, new_M
 
-class UCBwLP(mfLiveBatch):
+class UCBwILP(mfLiveBatch):
     def __init__(self, env, beta=None, fidelity_thresholds=None, lipschitz_constant=1, num_of_starts=75, num_of_optim_epochs=25, hp_update_frequency=None, budget=10, cost_budget=4, initial_bias=0):
         super().__init__(env, beta, fidelity_thresholds, lipschitz_constant, num_of_starts, num_of_optim_epochs, hp_update_frequency, budget, cost_budget, initial_bias)
         self.num_of_fidelities = 1
@@ -404,7 +416,7 @@ class mfUCB(mfLiveBatch):
         super().__init__(env, beta, fidelity_thresholds, lipschitz_constant, num_of_starts, num_of_optim_epochs, hp_update_frequency, budget, cost_budget, initial_bias)
         self.query_being_evaluated = False
         # costs thresholds to double the fidelity thresholds
-        self.cost_thresholds = [0] + [self.env.func.expected_costs[i + 1] / self.env.func.expected_costs[i] \
+        self.cost_thresholds = [0] + [self.env.func.expected_costs[i] / self.env.func.expected_costs[i +1] \
              for i in range(self.num_of_fidelities - 1)]
 
     def optim_loop(self):
@@ -455,11 +467,11 @@ class mfUCB(mfLiveBatch):
             self.query_being_evaluated = False
         
         # update hyperparams if needed
-        for fid in range(self.num_of_fidelities):
-            if (self.hp_update_frequency is not None) & (len(self.X[fid]) > 0):
-                if len(self.X[fid]) % self.hp_update_frequency == 0:
-                    self.model[fid].optim_hyperparams()
-                    self.gp_hyperparams[fid] = self.model[fid].current_hyperparams()
+        if (self.hp_update_frequency is not None) & (len(self.X[self.num_of_fidelities - 1]) > 0):
+            if len(self.X[self.num_of_fidelities - 1]) % self.hp_update_frequency == 0:
+                self.model[self.num_of_fidelities - 1].optim_hyperparams()
+                for fid2 in range(self.num_of_fidelities):
+                    self.gp_hyperparams[fid2] = self.model[self.num_of_fidelities - 1].current_hyperparams()
         # update current temperature and time
         self.current_time = self.current_time + 1
     
@@ -571,7 +583,7 @@ class mfUCBPlus(mfLiveBatch):
         super().__init__(env, beta, fidelity_thresholds, lipschitz_constant, num_of_starts, num_of_optim_epochs, hp_update_frequency, budget, cost_budget, initial_bias)
         self.query_being_evaluated = False
         # costs thresholds to double the fidelity thresholds
-        self.cost_thresholds = [0] + [self.env.func.expected_costs[i + 1] / self.env.func.expected_costs[i] \
+        self.cost_thresholds = [0] + [self.env.func.expected_costs[i] / self.env.func.expected_costs[i + 1] \
              for i in range(self.num_of_fidelities - 1)]
 
     def optim_loop(self):
@@ -640,11 +652,11 @@ class mfUCBPlus(mfLiveBatch):
             self.update_model_bias(bias_update_set)
         
         # update hyperparams if needed
-        for fid in range(self.num_of_fidelities):
-            if (self.hp_update_frequency is not None) & (len(self.X[fid]) > 0):
-                if len(self.X[fid]) % self.hp_update_frequency == 0:
-                    self.model[fid].optim_hyperparams()
-                    self.gp_hyperparams[fid] = self.model[fid].current_hyperparams()
+        if (self.hp_update_frequency is not None) & (len(self.X[self.num_of_fidelities - 1]) > 0):
+            if len(self.X[self.num_of_fidelities - 1]) % self.hp_update_frequency == 0:
+                self.model[self.num_of_fidelities - 1].optim_hyperparams()
+                for fid2 in range(self.num_of_fidelities):
+                    self.gp_hyperparams[fid2] = self.model[self.num_of_fidelities - 1].current_hyperparams()
         # update current temperature and time
         self.current_time = self.current_time + 1
     
@@ -684,116 +696,3 @@ class simpleUCB(mfUCB):
     def __init__(self, env, beta=None, fidelity_thresholds=None, lipschitz_constant=1, num_of_starts=75, num_of_optim_epochs=25, hp_update_frequency=None, budget=10, cost_budget=4, initial_bias=0):
         super().__init__(env, beta, fidelity_thresholds, lipschitz_constant, num_of_starts, num_of_optim_epochs, hp_update_frequency, budget, cost_budget, initial_bias)
         self.num_of_fidelities = 1
-
-class UCBwILP(UCBwLP):
-    def __init__(self, env, beta=None, fidelity_thresholds=None, lipschitz_constant=1, num_of_starts=75, num_of_optim_epochs=25, \
-         hp_update_frequency=None, budget=10, cost_budget=4, penalization_gammma = 1, initial_bias=0):
-        super().__init__(env, beta, fidelity_thresholds, lipschitz_constant, num_of_starts, num_of_optim_epochs, hp_update_frequency, budget, cost_budget, initial_bias)
-        self.penalization_gamma = penalization_gammma
-    
-    def build_af(self, X):
-        '''
-        This takes input locations, X, and returns the value of the acquisition function
-        '''
-        # check the batch of points being evaluated
-        batch = self.env.query_list
-        batch_fids = self.env.fidelities_list
-        # initialize ucb
-        ucb_shape = (self.num_of_fidelities, X.shape[0])
-        ucb = torch.zeros(size = ucb_shape)
-        # for every fidelity
-        for i in range(self.num_of_fidelities):
-            if self.X[i] != []:
-                if self.model[i].train_x == None:
-                    print('x')
-                mean, std = self.model[i].posterior(X)
-            else:
-                hypers = self.gp_hyperparams[i]
-                mean_constant = hypers[3]
-                constant = hypers[0]
-                mean, std = torch.tensor(mean_constant), torch.tensor(constant)
-            # calculate upper confidence bound
-            ucb[i, :] = mean + self.beta * std
-        # apply softmax transform if necessary
-        if self.soft_plus_transform: 
-            ucb = torch.log(1 + torch.exp(ucb))
-        # penalize acquisition function, loop through batch of evaluations
-        for i, penalty_point_fidelity in enumerate(zip(batch, batch_fids)):
-            penalty_point = penalty_point_fidelity[0].reshape(1, -1)
-            fidelity = int(penalty_point_fidelity[1])
-            # re-define penalty point as tensor
-            penalty_point = torch.tensor(penalty_point)
-            # calculate mean and variance of model at penalty point
-            mean_pp, std_pp = self.model[fidelity].posterior(penalty_point)
-            # calculate values of r_j
-            r_j = (self.max_value[fidelity] - mean_pp) / self.lipschitz_constant[fidelity]
-            denominator = r_j + self.penalization_gamma * std_pp / self.lipschitz_constant[fidelity]
-            # calculate norm between x and penalty point
-            norm = torch.norm(penalty_point - X, dim = 1)
-            # define penaliser
-            penaliser = torch.min(norm / denominator, 1)
-            # penalise ucb
-            ucb[fidelity, :] = ucb[fidelity, :].clone() * penaliser
-        # return acquisition function
-        min_ucb, _ = torch.min(ucb, dim = 0)
-        return min_ucb
-
-class mfLiveBatchIP(mfLiveBatch):
-    def __init__(self, env, beta=None, fidelity_thresholds=None, lipschitz_constant=1, num_of_starts=75, num_of_optim_epochs=25, \
-         hp_update_frequency=None, budget=10, cost_budget=4, penalization_gamma = 1, initial_bias=0):
-        super().__init__(env, beta, fidelity_thresholds, lipschitz_constant, num_of_starts, num_of_optim_epochs, hp_update_frequency, budget, cost_budget, initial_bias)
-        self.penalization_gamma = penalization_gamma
-    
-    def build_af(self, X):
-        '''
-        This takes input locations, X, and returns the value of the acquisition function
-        '''
-        # check the batch of points being evaluated
-        batch = self.env.query_list
-        batch_fids = self.env.fidelities_list
-        # initialize ucb
-        ucb_shape = (self.num_of_fidelities, X.shape[0])
-        ucb = torch.zeros(size = ucb_shape)
-        # for every fidelity
-        for i in range(self.num_of_fidelities):
-            if self.X[i] != []:
-                if self.model[i].train_x == None:
-                    print('x')
-                mean, std = self.model[i].posterior(X)
-            else:
-                hypers = self.gp_hyperparams[i]
-                mean_constant = hypers[3]
-                constant = hypers[0]
-                mean, std = torch.tensor(mean_constant), torch.tensor(constant)
-            # calculate upper confidence bound
-            ucb[i, :] = mean + self.beta * std + self.bias[i]
-        # apply softmax transform if necessary
-        if self.soft_plus_transform: 
-            ucb = torch.log(1 + torch.exp(ucb))
-        # penalize acquisition function, loop through batch of evaluations
-        for i, penalty_point_fidelity in enumerate(zip(batch, batch_fids)):
-            penalty_point = penalty_point_fidelity[0].reshape(1, -1)
-            fidelity = int(penalty_point_fidelity[1])
-            # re-define penalty point as tensor
-            penalty_point = torch.tensor(penalty_point)
-            # calculate mean and variance of model at penalty point
-            if self.X[fidelity] != []:
-                mean_pp, std_pp = self.model[fidelity].posterior(penalty_point)
-            else:
-                hypers = self.gp_hyperparams[i]
-                mean_constant = hypers[3]
-                constant = hypers[0]
-                mean_pp, std_pp = torch.tensor(mean_constant), torch.tensor(constant)
-
-            # calculate values of r_j
-            r_j = (self.max_value[fidelity] - mean_pp) / self.lipschitz_constant[fidelity]
-            denominator = r_j + self.penalization_gamma * std_pp / self.lipschitz_constant[fidelity]
-            # calculate norm between x and penalty point
-            norm = torch.norm(penalty_point - X, dim = 1)
-            # define penaliser
-            penaliser = torch.min(norm / denominator, torch.tensor([1]))
-            # penalise ucb
-            ucb[fidelity, :] = ucb[fidelity, :].clone() * penaliser
-        # return acquisition function
-        min_ucb, _ = torch.min(ucb, dim = 0)
-        return min_ucb
