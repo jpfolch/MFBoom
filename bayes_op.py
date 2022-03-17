@@ -4,10 +4,11 @@ from gp_utils import BoTorchGP
 from botorch.acquisition.analytic import ExpectedImprovement, ProbabilityOfImprovement
 from botorch.optim.initializers import initialize_q_batch_nonneg
 import sobol_seq
+from gpytorch.kernels import MaternKernel, ScaleKernel
 
 class mfLiveBatch():
     def __init__(self, env, beta = None, fidelity_thresholds = None, lipschitz_constant = 1, num_of_starts = 75, num_of_optim_epochs = 25, \
-        hp_update_frequency = None, budget = 10, cost_budget = 4, initial_bias = 0):
+        hp_update_frequency = None, budget = 10, cost_budget = 4, initial_bias = 0.1):
         '''
         Takes as inputs:
         env - optimization environment
@@ -31,13 +32,22 @@ class mfLiveBatch():
         self.num_of_fidelities = self.env.num_of_fidelities
         if fidelity_thresholds is None:
             self.fidelity_thresholds = [0.1 for _ in range(self.num_of_fidelities)]
+            self.fidelity_thresholds_init = [0.1 for _ in range(self.num_of_fidelities)]
         else:
             self.fidelity_thresholds = fidelity_thresholds
+            self.fidelity_thresholds_init = fidelity_thresholds.copy()
+        # costs thresholds to double the fidelity thresholds
+        self.cost_thresholds = [0] + [self.env.func.expected_costs[i + 1] / self.env.func.expected_costs[i] * self.cost_budget \
+             for i in range(self.num_of_fidelities - 1)]
         
+        # initialize count list
+        self.fidelity_count_list = [0 for _ in range(self.num_of_fidelities)]
+        # initialize bias
         if type(initial_bias) in [float, int]:
-            self.max_bias = [0] + [initial_bias for _ in range(self.num_of_fidelities - 1)]
+            self.bias_list = [i for i in range(self.num_of_fidelities)]
+            self.bias_constant = initial_bias
         else:
-            self.max_bias = initial_bias
+            self.bias_list = initial_bias
 
         # gp hyperparams
         self.set_hyperparams()
@@ -46,7 +56,7 @@ class mfLiveBatch():
         if beta == None:
             self.fixed_beta = False
             self.beta = float(0.2 * self.dim * np.log(2 * (self.env.current_time + 1)))
-        else:  
+        else:
             self.fixed_beta = True
             self.beta = beta
 
@@ -117,7 +127,8 @@ class mfLiveBatch():
         # define model
         self.model = [BoTorchGP(lengthscale_dim = self.dim) for _ in range(self.num_of_fidelities)]
         # define bias model
-        self.bias_model = [BoTorchGP(lengthscale_dim = self.dim) for _ in range(self.num_of_fidelities)]
+        bias_kernel = ScaleKernel(MaternKernel(nu = 1.5, ard_num_dims = self.dim))
+        self.bias_model = [BoTorchGP(lengthscale_dim = self.dim, kernel = bias_kernel) for _ in range(self.num_of_fidelities)]
         # time
         self.current_time = 0
         # initialise new_obs
@@ -175,16 +186,28 @@ class mfLiveBatch():
                 self.X[fid].append(list(obtain_query[i, :].reshape(-1)))
                 self.Y[fid].append(self.new_obs[i])
                 self.T[fid].append(self.current_time + 1)
-                # if fidelity is not the lowest, check bias assumption and obtain bias observation
+                # if fidelity is not the lowest, check bias assumption. If broken, double the penalty.
                 if fid != self.num_of_fidelities - 1:
+                    # calculate posterior prediction
                     f_low_fid_pred, _ = self.model[fid + 1].posterior(obtain_query[i, :].reshape(1, -1))
                     f_low_fid_pred = f_low_fid_pred.detach().numpy()
                     f_high_fid_obs = self.new_obs[i]
+                    # check if difference is higher than expected
                     diff = float(f_high_fid_obs - f_low_fid_pred)
-                    self.max_bias[fid + 1] = max(1.2 * diff, self.max_bias[fid + 1])
-                    self.bias_X[fid + 1].append(list(obtain_query[i, :].reshape(-1)))
-                    self.bias_Y[fid + 1].append(diff)
-                    bias_updates.append(fid)
+                    if diff > self.bias_constant:
+                        self.bias_constant = 1.2 * diff
+                    # if we observe highest fidelity, obtain bias observations
+                    if fid == 0:
+                        for lower_fid in range(1, self.num_of_fidelities):
+                            # check the mean of each prediction
+                            f_low_fid_pred, _ = self.model[lower_fid].posterior(obtain_query[i, :].reshape(1, -1))
+                            f_low_fid_pred = f_low_fid_pred.detach().numpy()
+                            # calculate difference
+                            diff = f_high_fid_obs - f_low_fid_pred
+                            # append corresponding bias observations
+                            self.bias_X[lower_fid].append(list(obtain_query[i, :].reshape(-1)))
+                            self.bias_Y[lower_fid].append(diff)
+                            bias_updates.append(lower_fid)
                 # redefine new maximum value
                 self.max_value[fid] = float(max(self.max_value[fid], float(self.new_obs[i])))
                 # take away batch cost
@@ -236,10 +259,10 @@ class mfLiveBatch():
         '''
         if self.new_obs is not None:
             for i in update_set:
-                i = int(i) + 1
+                i = int(i)
                 # fit new bias models
                 hypers_function = list(self.model[i].current_hyperparams())
-                hypers = ((self.max_bias[i] / self.beta)**2, hypers_function[1] / 2, 1e-3, 0)
+                hypers = ((self.bias_list[i] * self.bias_constant / self.beta)**2, hypers_function[1], 1e-3, 0)
                 self.bias_model[i].fit_model(self.bias_X[i], self.bias_Y[i], previous_hyperparams=hypers)
 
     def build_af(self, X):
@@ -268,7 +291,7 @@ class mfLiveBatch():
             if self.bias_X[i] != []:
                 mean_bias, std_bias = self.bias_model[i].posterior(X)
             else:
-                mean_bias, std_bias = torch.tensor(0), torch.tensor(self.max_bias[i]) / self.beta
+                mean_bias, std_bias = torch.tensor(0), torch.tensor(self.bias_list[i] * self.bias_constant) / self.beta
             ucb_bias = mean_bias + self.beta * std_bias
             # calculate total upper confidence bound
             ucb[i, :] = mean + self.beta * std + ucb_bias
@@ -338,6 +361,11 @@ class mfLiveBatch():
 
         # now choose the corresponding fidelity
         for i in reversed(range(self.num_of_fidelities)):
+            # set fidelity
+            new_M = np.array(i).reshape(1, 1)
+            # if we reach target fidelity, break
+            if i == 0:
+                break
             # if there is data use posterior, else use prior
             if self.X[i] != []:
                 _, std = self.model[i].posterior(new_X)
@@ -346,12 +374,21 @@ class mfLiveBatch():
                 mean_constant = hypers[3]
                 constant = hypers[0]
                 _, std = torch.tensor(mean_constant), torch.tensor(constant)
+            
             # check fidelity thresholds
             threshold = self.beta * std
-            new_M = np.array(i).reshape(1, 1)
             if threshold > self.fidelity_thresholds[i]:
                 break
-
+        
+        new_M_int = int(new_M)
+        self.fidelity_count_list[new_M_int] = self.fidelity_count_list[new_M_int] + 1
+        if new_M_int != self.num_of_fidelities - 1:
+            self.fidelity_count_list[new_M_int + 1] = 0
+        
+        if (self.fidelity_count_list[new_M_int] > self.cost_thresholds[new_M_int]) & (new_M_int != 0):
+            self.fidelity_thresholds[new_M_int] = self.fidelity_thresholds[new_M_int] + self.fidelity_thresholds_init[new_M_int]
+            self.fidelity_count_list[new_M_int] = 0
+        
         return new_X, new_M
 
 class UCBwLP(mfLiveBatch):
@@ -366,6 +403,9 @@ class mfUCB(mfLiveBatch):
     def __init__(self, env, beta=None, fidelity_thresholds=None, lipschitz_constant=1, num_of_starts=75, num_of_optim_epochs=25, hp_update_frequency=None, budget=10, cost_budget=4, initial_bias=0):
         super().__init__(env, beta, fidelity_thresholds, lipschitz_constant, num_of_starts, num_of_optim_epochs, hp_update_frequency, budget, cost_budget, initial_bias)
         self.query_being_evaluated = False
+        # costs thresholds to double the fidelity thresholds
+        self.cost_thresholds = [0] + [self.env.func.expected_costs[i + 1] / self.env.func.expected_costs[i] \
+             for i in range(self.num_of_fidelities - 1)]
 
     def optim_loop(self):
         '''
@@ -399,19 +439,20 @@ class mfUCB(mfLiveBatch):
                 self.T[fid].append(self.current_time + 1)
                 # if fidelity is not the lowest, check bias assumption
                 if fid != self.num_of_fidelities - 1:
+                    # calculate posterior prediction
                     f_low_fid_pred, _ = self.model[fid + 1].posterior(obtain_query[i, :].reshape(1, -1))
                     f_low_fid_pred = f_low_fid_pred.detach().numpy()
                     f_high_fid_obs = self.new_obs[i]
+                    # check if difference is higher than expected
                     diff = float(f_high_fid_obs - f_low_fid_pred)
-                    self.max_bias[fid + 1] = max(1.2 * diff, self.max_bias[fid + 1])
-                # redefine new maximum value
-                self.max_value[fid] = float(max(self.max_value[fid], float(self.new_obs[i])))
-                # query no longer being evaluated
-                self.query_being_evaluated = False
+                    if diff > self.bias_constant:
+                        self.bias_constant = 1.2 * diff
 
             # check which model need to be updated according to the fidelities
             update_set = set(obtain_fidelities.reshape(-1))
             self.update_model(update_set)
+            # this means we are no longer evaluating a query
+            self.query_being_evaluated = False
         
         # update hyperparams if needed
         for fid in range(self.num_of_fidelities):
@@ -442,11 +483,85 @@ class mfUCB(mfLiveBatch):
                 constant = hypers[0]
                 mean, std = torch.tensor(mean_constant), torch.tensor(constant)
             # calculate upper confidence bound
-            ucb[i, :] = mean + self.beta * std + self.max_bias[i]
+            ucb[i, :] = mean + self.beta * std + self.bias_list[i] * self.bias_constant
         
         # return acquisition function
         min_ucb, _ = torch.min(ucb, dim = 0)
         return min_ucb
+
+    def optimise_af(self):
+        '''
+        This function optimizes the acquisition function, and returns the next query point
+        '''
+        # if time is zero, pick point at random, lowest fidelity
+        if self.current_time == 0:
+            new_X = np.random.uniform(size = self.dim).reshape(1, -1)
+            new_M = np.array(self.num_of_fidelities - 1).reshape(1, 1)
+            return new_X, new_M
+        
+        # optimisation bounds
+        bounds = torch.stack([torch.zeros(self.dim), torch.ones(self.dim)])
+        # random initialization, multiply by 100
+        X = torch.rand(100 * self.num_of_starts, self.dim).double()
+        X.requires_grad = True
+        # define optimiser
+        optimiser = torch.optim.Adam([X], lr = 0.0001)
+        af = self.build_af(X)
+        
+        # do the optimisation
+        for _ in range(self.num_of_optim_epochs):
+            # set zero grad
+            optimiser.zero_grad()
+            # losses for optimiser
+            losses = -self.build_af(X)
+            loss = losses.sum()
+            loss.backward()
+            # optim step
+            optimiser.step()
+
+            # make sure we are still within the bounds
+            for j, (lb, ub) in enumerate(zip(*bounds)):
+                X.data[..., j].clamp_(lb, ub)
+        
+        # find the best start
+        best_start = torch.argmax(-losses)
+
+        # corresponding best input
+        best_input = X[best_start, :].detach()
+        best = best_input.detach().numpy().reshape(1, -1)
+        new_X = best.reshape(1, -1)
+
+        # now choose the corresponding fidelity
+        for i in reversed(range(self.num_of_fidelities)):
+            # set fidelity
+            new_M = np.array(i).reshape(1, 1)
+            # if we reach target fidelity, break
+            if i == 0:
+                break
+            # if there is data use posterior, else use prior
+            if self.X[i] != []:
+                _, std = self.model[i].posterior(new_X)
+            else:
+                hypers = self.gp_hyperparams[i]
+                mean_constant = hypers[3]
+                constant = hypers[0]
+                _, std = torch.tensor(mean_constant), torch.tensor(constant)
+
+            # check fidelity thresholds
+            threshold = self.beta * std
+            if threshold > self.fidelity_thresholds[i]:
+                break
+        
+        new_M_int = int(new_M)
+        self.fidelity_count_list[new_M_int] = self.fidelity_count_list[new_M_int] + 1
+        if new_M_int != self.num_of_fidelities - 1:
+            self.fidelity_count_list[new_M_int + 1] = 0
+        
+        if (self.fidelity_count_list[new_M_int] > self.cost_thresholds[new_M_int]) & (new_M_int != 0):
+            self.fidelity_thresholds[new_M_int] = self.fidelity_thresholds[new_M_int] + self.fidelity_thresholds_init[new_M_int]
+            self.fidelity_count_list[new_M_int] = 0
+        
+        return new_X, new_M
 
 class mfUCBPlus(mfLiveBatch):
     '''
@@ -455,6 +570,9 @@ class mfUCBPlus(mfLiveBatch):
     def __init__(self, env, beta=None, fidelity_thresholds=None, lipschitz_constant=1, num_of_starts=75, num_of_optim_epochs=25, hp_update_frequency=None, budget=10, cost_budget=4, initial_bias=0):
         super().__init__(env, beta, fidelity_thresholds, lipschitz_constant, num_of_starts, num_of_optim_epochs, hp_update_frequency, budget, cost_budget, initial_bias)
         self.query_being_evaluated = False
+        # costs thresholds to double the fidelity thresholds
+        self.cost_thresholds = [0] + [self.env.func.expected_costs[i + 1] / self.env.func.expected_costs[i] \
+             for i in range(self.num_of_fidelities - 1)]
 
     def optim_loop(self):
         '''
@@ -487,18 +605,29 @@ class mfUCBPlus(mfLiveBatch):
                 self.X[fid].append(list(obtain_query[i, :].reshape(-1)))
                 self.Y[fid].append(self.new_obs[i])
                 self.T[fid].append(self.current_time + 1)
-                # if fidelity is not the lowest, check bias assumption
                 if fid != self.num_of_fidelities - 1:
-                    if self.model[fid + 1].model is None:
-                        print('Wut')
+                    # calculate posterior prediction
                     f_low_fid_pred, _ = self.model[fid + 1].posterior(obtain_query[i, :].reshape(1, -1))
                     f_low_fid_pred = f_low_fid_pred.detach().numpy()
                     f_high_fid_obs = self.new_obs[i]
+                    # check if difference is higher than expected
                     diff = float(f_high_fid_obs - f_low_fid_pred)
-                    self.max_bias[fid + 1] = max(1.2 * diff, self.max_bias[fid + 1])
-                    self.bias_X[fid + 1].append(list(obtain_query[i, :].reshape(-1)))
-                    self.bias_Y[fid + 1].append(diff)
-                    bias_updates.append(fid)
+                    if diff > self.bias_constant:
+                        self.bias_constant = 1.2 * diff
+                    # if we observe highest fidelity, obtain bias observations
+                    if fid == 0:
+                        for lower_fid in range(1, self.num_of_fidelities):
+                            # check the mean of each prediction
+                            f_low_fid_pred, _ = self.model[lower_fid].posterior(obtain_query[i, :].reshape(1, -1))
+                            f_low_fid_pred = f_low_fid_pred.detach().numpy()
+                            # calculate difference
+                            diff = f_high_fid_obs - f_low_fid_pred
+                            # append corresponding bias observations
+                            self.bias_X[lower_fid].append(list(obtain_query[i, :].reshape(-1)))
+                            self.bias_Y[lower_fid].append(diff)
+                            bias_updates.append(lower_fid)
+                            if lower_fid == 2:
+                                print('wut')
                 # redefine new maximum value
                 self.max_value[fid] = float(max(self.max_value[fid], float(self.new_obs[i])))
                 # query no longer being evaluated
@@ -542,7 +671,7 @@ class mfUCBPlus(mfLiveBatch):
             if self.bias_X[i] != []:
                 mean_bias, std_bias = self.bias_model[i].posterior(X)
             else:
-                mean_bias, std_bias = torch.tensor(0), torch.tensor(self.max_bias[i]) / self.beta
+                mean_bias, std_bias = torch.tensor(0), torch.tensor(self.bias_list[i] * self.bias_constant) / self.beta
             ucb_bias = mean_bias + self.beta * std_bias
             # calculate upper confidence bound
             ucb[i, :] = mean + self.beta * std + ucb_bias
