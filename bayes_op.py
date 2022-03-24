@@ -398,7 +398,8 @@ class mfLiveBatch():
             self.fidelity_count_list[new_M_int + 1] = 0
         
         if (self.fidelity_count_list[new_M_int] > self.cost_thresholds[new_M_int]) & (new_M_int != 0):
-            self.fidelity_thresholds[new_M_int] = self.fidelity_thresholds[new_M_int] + self.fidelity_thresholds_init[new_M_int]
+            # self.fidelity_thresholds[new_M_int] = self.fidelity_thresholds[new_M_int] + self.fidelity_thresholds_init[new_M_int] * self.dim
+            self.fidelity_thresholds[new_M_int] = self.fidelity_thresholds[new_M_int] * 2
             self.fidelity_count_list[new_M_int] = 0
         
         return new_X, new_M
@@ -570,7 +571,8 @@ class mfUCB(mfLiveBatch):
             self.fidelity_count_list[new_M_int + 1] = 0
         
         if (self.fidelity_count_list[new_M_int] > self.cost_thresholds[new_M_int]) & (new_M_int != 0):
-            self.fidelity_thresholds[new_M_int] = self.fidelity_thresholds[new_M_int] + self.fidelity_thresholds_init[new_M_int]
+            # self.fidelity_thresholds[new_M_int] = self.fidelity_thresholds[new_M_int] + self.fidelity_thresholds_init[new_M_int]
+            self.fidelity_thresholds[new_M_int] = self.fidelity_thresholds[new_M_int] * 2
             self.fidelity_count_list[new_M_int] = 0
         
         return new_X, new_M
