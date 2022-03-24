@@ -130,3 +130,10 @@ dmypy.json
 
 # apple stuff
 .DS_Store
+
+# experiments
+experiment_results/
+experiment_results2/
+
+# HPC submit
+submit.pbs 
