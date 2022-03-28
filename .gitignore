@@ -137,3 +137,6 @@ experiment_results2/
 
 # HPC submit
 submit.pbs 
+
+# Figures
+Figures/
