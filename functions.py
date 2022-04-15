@@ -1,5 +1,9 @@
 import numpy as np
 import torch
+import random
+import pandas as pd
+from sklearn.svm import SVC
+from sklearn.metrics import accuracy_score
 
 class CurrinExp2D():
     def __init__(self):
@@ -239,7 +243,7 @@ class Hartmann6D():
 
     def evaluate(self, x, m):
 
-        assert m in [0, 1, 2, 3], 'Hartmann6D only has four fidelities'
+        assert m in [0, 1, 2], 'Hartmann6D only has three fidelities'
 
         sum1 = 0
         for i in range(0, 4):
@@ -256,10 +260,8 @@ class Hartmann6D():
             if m == 0:
                 times.append(100)
             elif m == 1:
-                times.append(25)
+                times.append(10)
             elif m == 2:
-                times.append(5)
-            elif m == 3:
                 times.append(1)
         return np.array(times).reshape(-1, 1)
 
@@ -323,6 +325,83 @@ class Borehole8D():
             else:
                 times.append(1)
         return np.array(times).reshape(-1, 1)
+
+class MagicGammaSVM():
+    def __init__(self):
+        self.dim = 2
+        self.optimum = 1
+        self.num_of_fidelities = 2
+        self.name = 'MagicGamma'
+        self.require_transform = False
+        self.fidelity_costs = [1, 1]
+        self.expected_costs = [16, 1]
+        self.initalize_training_sets()
+    
+    def initalize_training_sets(self):
+        # select data
+        file_name = 'data/magic04.data'
+        # read data
+        df = pd.read_csv(file_name, sep = ',', header = None)
+        # select seed so that we always choose the same data-set
+        seed = 98616134
+        np.random.seed(seed)
+        random.seed(seed)
+
+        idxs = list(range(0, len(df)))
+        random.shuffle(idxs)
+
+        train_hf_idx = idxs[:2000]
+        train_lf_idx = idxs[:500]
+
+        test_idx = idxs[10000:]
+
+        self.X_train_hf = df.loc[train_hf_idx, :9].to_numpy()
+        self.Y_train_hf = df.loc[train_hf_idx, 10].to_numpy()
+
+        self.X_train_lf = df.loc[train_lf_idx, :9].to_numpy()
+        self.Y_train_lf = df.loc[train_lf_idx, 10].to_numpy()
+
+        self.X_test = df.loc[test_idx, :9].to_numpy()
+        self.Y_test = df.loc[test_idx, 10].to_numpy()
+    
+    def evaluate(self, x, m):
+        num_of_queries = x.shape[0]
+        Y_out = []
+
+        for i in range(num_of_queries):
+            # redefine exponent values
+            x0 = float(x[i, 0] * (6 - (-1)) + (-1))
+            x1 = float(x[i, 1] * (1 - (-5)) + (-5))
+            # define SVM model
+            svm_classifier = SVC(C = 10**(x0), gamma = 10**(x1))
+            # train on high fidelity or low fidelity depending on request
+            if m == 0:
+                svm_classifier.fit(self.X_train_hf, self.Y_train_hf)
+            
+            if m == 1:
+                svm_classifier.fit(self.X_train_lf, self.Y_train_lf)
+            # evaluate output
+            Y_pred = svm_classifier.predict(self.X_test)
+            Y_out.append(accuracy_score(self.Y_test, Y_pred))
+        
+        return np.array(Y_out)
+    
+    def eval_times(self, M):
+        # returns evaluation times for each query
+        times = []
+        for m in M:
+            if m == 0:
+                times.append(16)
+            else:
+                times.append(1)
+        return np.array(times).reshape(-1, 1)
+
+
+# func = MagicGammaSVM()
+# x0 = np.array([0, 0]).reshape(1, -1)
+# x1 = np.array([1, 1]).reshape(1, -1)
+# print(func.evaluate(x0, 0))
+# print(func.evaluate(x1, 0))
 
 def find_optimum(func, n_starts = 25, n_epochs = 100):
     # find dimension
