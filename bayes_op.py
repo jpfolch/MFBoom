@@ -171,7 +171,6 @@ class mfLiveBatch():
             new_Xs = np.concatenate((new_Xs, new_X))
             new_Ms = np.concatenate((new_Ms, new_M))
             self.batch_costs = self.batch_costs + self.env.func.fidelity_costs[int(new_M)]
-
         obtain_query, obtain_fidelities, self.new_obs = self.env.step(new_Xs, new_Ms)
 
         # update model if there are new observations
@@ -341,11 +340,21 @@ class mfLiveBatch():
         
         # optimisation bounds
         bounds = torch.stack([torch.zeros(self.dim), torch.ones(self.dim)])
-        # random initialization, multiply by 100
-        X = torch.rand(100 * self.num_of_starts, self.dim).double()
+        # sobol initialization initialization, on 100 * num_of_starts, check for best 10 and optimize from there
+        sobol_gen = torch.quasirandom.SobolEngine(self.dim, scramble = True)
+        X = sobol_gen.draw(100 * self.num_of_starts * self.dim).double()
+
+        with torch.no_grad():
+            af = self.build_af(X)
+            idx_list = list(range(0, self.num_of_starts * 100 * self.dim))
+            sorted_af_idx = [idx for _, idx in sorted(zip(af, idx_list))]
+            best_idx = sorted_af_idx[-10:]
+
+        # choose best starts for X
+        X = X[best_idx, :]
         X.requires_grad = True
         # define optimiser
-        optimiser = torch.optim.Adam([X], lr = 0.0001)
+        optimiser = torch.optim.Adam([X], lr = 0.01)
         af = self.build_af(X)
         
         # do the optimisation
@@ -432,10 +441,23 @@ class mfUCB(mfLiveBatch):
         new_Ms = np.empty((0, 1))
 
         if self.query_being_evaluated is False:
+            # obtain new query
             new_X, new_M = self.optimise_af()
             new_Xs = np.concatenate((new_Xs, new_X))
             new_Ms = np.concatenate((new_Ms, new_M))
+            # add to batch costs
+            self.batch_costs = self.batch_costs + self.env.func.fidelity_costs[int(new_M)]
+            # check if our main query is finished evaluating
             self.query_being_evaluated = True
+
+            # now fill the remaining batch space randomly
+            while self.batch_costs < self.cost_budget:
+                new_X = np.random.uniform(size = (1, self.dim))
+                # add to new_Xs and new_Ms
+                new_Xs = np.concatenate((new_Xs, new_X))
+                new_Ms = np.concatenate((new_Ms, new_M))
+                # add to batch costs
+                self.batch_costs = self.batch_costs + self.env.func.fidelity_costs[int(new_M)]
 
         obtain_query, obtain_fidelities, self.new_obs = self.env.step(new_Xs, new_Ms)
 
@@ -460,6 +482,8 @@ class mfUCB(mfLiveBatch):
                     diff = float(f_high_fid_obs - f_low_fid_pred)
                     if diff > self.bias_constant:
                         self.bias_constant = 1.2 * diff
+                # take away batch cost
+                self.batch_costs = self.batch_costs - self.env.func.fidelity_costs[fid]
 
             # check which model need to be updated according to the fidelities
             update_set = set(obtain_fidelities.reshape(-1))
@@ -514,11 +538,22 @@ class mfUCB(mfLiveBatch):
         
         # optimisation bounds
         bounds = torch.stack([torch.zeros(self.dim), torch.ones(self.dim)])
-        # random initialization, multiply by 100
-        X = torch.rand(100 * self.num_of_starts, self.dim).double()
+        
+        # sobol initialization initialization, on 100 * num_of_starts, check for best 10 and optimize from there
+        sobol_gen = torch.quasirandom.SobolEngine(self.dim, scramble = True)
+        X = sobol_gen.draw(100 * self.num_of_starts * self.dim).double()
+
+        with torch.no_grad():
+            af = self.build_af(X)
+            idx_list = list(range(0, self.num_of_starts * 100 * self.dim))
+            sorted_af_idx = [idx for _, idx in sorted(zip(af, idx_list))]
+            best_idx = sorted_af_idx[-10:]
+
+        # choose best starts for X
+        X = X[best_idx, :]
         X.requires_grad = True
         # define optimiser
-        optimiser = torch.optim.Adam([X], lr = 0.0001)
+        optimiser = torch.optim.Adam([X], lr = 0.01)
         af = self.build_af(X)
         
         # do the optimisation
@@ -600,10 +635,23 @@ class mfUCBPlus(mfLiveBatch):
         new_Ms = np.empty((0, 1))
 
         if self.query_being_evaluated is False:
+            # obtain new query
             new_X, new_M = self.optimise_af()
             new_Xs = np.concatenate((new_Xs, new_X))
             new_Ms = np.concatenate((new_Ms, new_M))
+            # add to batch costs
+            self.batch_costs = self.batch_costs + self.env.func.fidelity_costs[int(new_M)]
+            # check if our main query is finished evaluating
             self.query_being_evaluated = True
+
+            # now fill the remaining batch space randomly
+            while self.batch_costs < self.cost_budget:
+                new_X = np.random.uniform(size = (1, self.dim))
+                # add to new_Xs and new_Ms
+                new_Xs = np.concatenate((new_Xs, new_X))
+                new_Ms = np.concatenate((new_Ms, new_M))
+                # add to batch costs
+                self.batch_costs = self.batch_costs + self.env.func.fidelity_costs[int(new_M)]
 
         obtain_query, obtain_fidelities, self.new_obs = self.env.step(new_Xs, new_Ms)
 
@@ -644,6 +692,8 @@ class mfUCBPlus(mfLiveBatch):
                                 print('wut')
                 # redefine new maximum value
                 self.max_value[fid] = float(max(self.max_value[fid], float(self.new_obs[i])))
+                # remove cost
+                self.batch_costs = self.batch_costs - self.env.func.fidelity_costs[fid]
                 # query no longer being evaluated
                 self.query_being_evaluated = False
 
