@@ -29,8 +29,8 @@ class mfLiveBatch():
         # multifidelity parameters
         self.num_of_fidelities = self.env.num_of_fidelities
         if fidelity_thresholds is None:
-            self.fidelity_thresholds = [0.01 for _ in range(self.num_of_fidelities)]
-            self.fidelity_thresholds_init = [0.01 for _ in range(self.num_of_fidelities)]
+            self.fidelity_thresholds = [0.1 for _ in range(self.num_of_fidelities)]
+            self.fidelity_thresholds_init = [0.1 for _ in range(self.num_of_fidelities)]
         else:
             self.fidelity_thresholds = fidelity_thresholds
             self.fidelity_thresholds_init = fidelity_thresholds.copy()
