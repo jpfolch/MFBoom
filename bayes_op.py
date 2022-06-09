@@ -1,12 +1,12 @@
 import numpy as np
 import torch
-from gp_utils import BoTorchGP
+from gp_utils import MultiTaskBoTorchGP, BoTorchGP
 import sobol_seq
 from gpytorch.kernels import MaternKernel, ScaleKernel
 
 class mfLiveBatch():
     def __init__(self, env, beta = None, fidelity_thresholds = None, lipschitz_constant = 1, num_of_starts = 75, num_of_optim_epochs = 25, \
-        hp_update_frequency = None, budget = 10, cost_budget = 4, initial_bias = 0.1):
+        hp_update_frequency = None, budget = 10, cost_budget = 4, initial_bias = 0.1, local_lipschitz = True, increasing_thresholds = False):
         '''
         Takes as inputs:
         env - optimization environment
@@ -34,6 +34,9 @@ class mfLiveBatch():
         else:
             self.fidelity_thresholds = fidelity_thresholds
             self.fidelity_thresholds_init = fidelity_thresholds.copy()
+        self.increasing_thresholds = increasing_thresholds
+        # check if we need to update the maximum bias or it is set by the user
+        self.update_max_bias = True
         # costs thresholds to double the fidelity thresholds
         self.cost_thresholds = [0] + [self.env.func.expected_costs[i] / self.env.func.expected_costs[i + 1] * self.cost_budget \
              for i in range(self.num_of_fidelities - 1)]
@@ -53,18 +56,19 @@ class mfLiveBatch():
         # values of LP
         if beta == None:
             self.fixed_beta = False
-            self.beta = float(0.2 * self.dim * np.log(2 * (self.env.current_time + 1)))
+            self.beta = [float(0.2 * self.dim * np.log(2 * (self.env.current_time + 1))) for _ in range(self.num_of_fidelities)]
         else:
             self.fixed_beta = True
-            self.beta = beta
+            self.beta = [beta for _ in range(self.num_of_fidelities)]
         
         self.penalization_gamma = 1
 
-        # parameters of the method
+        # parameters of local penalization method
         self.lipschitz_constant = [lipschitz_constant for _ in range(self.num_of_fidelities)]
         self.max_value = [0 for _ in range(self.num_of_fidelities)]
         # initialize grid to select lipschitz constant
         self.estimate_lipschitz = True
+        self.local_lipschitz = local_lipschitz
         self.num_of_grad_points = 50 * self.dim
         self.lipschitz_grid = sobol_seq.i4_sobol_generate(self.dim, self.num_of_grad_points)
         # do we require transform?
@@ -76,8 +80,11 @@ class mfLiveBatch():
         # optimisation parameters
         self.num_of_starts = num_of_starts
         self.num_of_optim_epochs = num_of_optim_epochs
+        self.grid_search = False
+        self.grid_to_search = None
         # hp hyperparameters update frequency
         self.hp_update_frequency = hp_update_frequency
+        self.last_n_obs = [0 for _ in range(self.num_of_fidelities)]
 
         # define domain
         self.domain = np.zeros((self.dim,))
@@ -159,18 +166,57 @@ class mfLiveBatch():
         Performs a single loop of the optimisation
         '''
         # check if we need to update beta
+        # check if we need to update beta
         if self.fixed_beta == False:
-            self.beta = float(0.2 * self.dim * np.log(2 * (self.env.current_time + 1)))
+            beta = float(0.2 * self.dim * np.log(2 * (self.current_time + 1) / (self.env.func.expected_costs[0])))
+            self.beta = [beta for _ in range(self.num_of_fidelities)]
+
         # optimise acquisition function to obtain new queries until batch is full
 
         new_Xs = np.empty((0, self.dim))
         new_Ms = np.empty((0, 1))
+        
+        self.lipschitz_batch_list = []
+        # obtain current batch
+        self.current_batch = self.env.query_list.copy()
+        self.current_batch_fids = self.env.fidelities_list.copy()
+        if self.local_lipschitz:
+            for i, penalty_point_fidelity in enumerate(zip(self.current_batch, self.current_batch_fids)):
+                penalty_point = penalty_point_fidelity[0].reshape(1, -1)
+                fidelity = int(penalty_point_fidelity[1])
+                # re-define penalty point as tensor
+                penalty_point = torch.tensor(penalty_point)
+                # calculate local lipschitz constant
+                local_lip_constant = self.calculate_local_lipschitz(penalty_point, fidelity)
+                self.lipschitz_batch_list.append(local_lip_constant)
+        else:
+            # otherwise simply append the global lipschitz constant for each fidelity
+            batch = self.env.query_list
+            batch_fids = self.env.fidelities_list
+            for i, penalty_point_fidelity in enumerate(zip(batch, batch_fids)):
+                fidelity = int(penalty_point_fidelity[1])
+                self.lipschitz_batch_list.append(self.lipschitz_constant[fidelity])
 
+        # fill batch
         while self.batch_costs < self.cost_budget:
+            self.lipshitz_batch_list = []
             new_X, new_M = self.optimise_af()
             new_Xs = np.concatenate((new_Xs, new_X))
             new_Ms = np.concatenate((new_Ms, new_M))
+            # add new_X and new_M to current batch
+            self.current_batch = np.concatenate((self.current_batch, new_X))
+            self.current_batch_fids = np.concatenate((self.current_batch_fids, new_M))
+            # update batch costs
             self.batch_costs = self.batch_costs + self.env.func.fidelity_costs[int(new_M)]
+            # if loop is not going to break, add new lipschitz constant
+            if self.batch_costs < self.cost_budget:
+                # new_M and new_X define the penalty point
+                fidelity = int(new_M)
+                penalty_point = torch.tensor(new_X)
+                # calculate local lipschitz constant
+                local_lip_constant = self.calculate_local_lipschitz(penalty_point, fidelity)
+                self.lipschitz_batch_list.append(local_lip_constant)
+
         obtain_query, obtain_fidelities, self.new_obs = self.env.step(new_Xs, new_Ms)
 
         # update model if there are new observations
@@ -193,7 +239,7 @@ class mfLiveBatch():
                     f_high_fid_obs = self.new_obs[i]
                     # check if difference is higher than expected
                     diff = float(f_high_fid_obs - f_low_fid_pred)
-                    if diff > self.bias_constant:
+                    if (diff > self.bias_constant) & (self.update_max_bias):
                         self.bias_constant = 1.2 * diff
                     # if we observe highest fidelity, obtain bias observations
                     if fid == 0:
@@ -217,19 +263,55 @@ class mfLiveBatch():
             bias_update_set = set(bias_updates)
             self.update_model(update_set)
             self.update_model_bias(bias_update_set)
-        
+
         # update hyperparams if needed
+        # if there is only one fidelity, simple case
         if self.num_of_fidelities == 1:
+            n_obs = 0
+            for fid in range(self.num_of_fidelities):
+                n_obs = n_obs + len(self.X[fid])
+
             if (self.hp_update_frequency is not None) & (len(self.X[0]) > 0):
-                if len(self.X[0]) % self.hp_update_frequency == 0:
+                if (n_obs >= (self.hp_update_frequency + self.last_n_obs[0])):
+                    self.last_n_obs[fid] = n_obs
                     self.model[0].optim_hyperparams()
                     self.gp_hyperparams[0] = self.model[0].current_hyperparams()
-
-        if (self.hp_update_frequency is not None) & (len(self.X[self.num_of_fidelities - 1]) > 0):
-            if len(self.X[self.num_of_fidelities - 1]) % self.hp_update_frequency == 0:
-                self.model[self.num_of_fidelities - 1].optim_hyperparams()
-                for fid2 in range(self.num_of_fidelities):
-                    self.gp_hyperparams[fid2] = self.model[self.num_of_fidelities - 1].current_hyperparams()
+        # multi-fidelity case is more complicated. We use the lowest fidelity as the base for our initializations
+        else:
+            # first fidelity is special, as we might retrain all other models as well
+            if (self.hp_update_frequency is not None) & (len(self.X[self.num_of_fidelities - 1]) > 0):
+                n_obs = len(self.X[self.num_of_fidelities - 1])
+                # check if enough observations have passed since last time
+                if (n_obs >= (self.hp_update_frequency + self.last_n_obs[self.num_of_fidelities - 1])):
+                    # update n on last update
+                    self.last_n_obs[self.num_of_fidelities - 1] = n_obs
+                    # optimize hyperparameters
+                    self.model[self.num_of_fidelities - 1].optim_hyperparams()
+                    self.gp_hyperparams[self.num_of_fidelities - 1] = self.model[self.num_of_fidelities - 1].current_hyperparams()
+                    # for fid2 in range(self.num_of_fidelities - 1):
+                        # obtain hyperparameters of lower model
+                        # self.gp_hyperparams[fid2] = self.model[self.num_of_fidelities - 1].current_hyperparams()
+                        # if we have enough observations for the other fidelities, retrain those as well but not the prior mean constant
+                        # if len(self.X[fid2]) > 10:
+                        #     self.model[fid2].set_hyperparams(self.model[self.num_of_fidelities - 1].current_hyperparams())
+                        #    self.model[fid2].optim_hyperparams(train_only_outputscale_and_noise = True)
+                        #    self.gp_hyperparams[fid2] = self.model[fid2].current_hyperparams()
+            
+            # we further train the hyper-parameters whenever we reach the correct number of new observations for each fidelity
+            for fid in range(self.num_of_fidelities - 1):
+                # obtain number of observations
+                n_obs = len(self.X[fid])
+                # update the hyper-parameters if there are enough new observations
+                if (self.hp_update_frequency is not None) & (len(self.X[fid]) > 0):
+                    if (n_obs >= (self.hp_update_frequency + self.last_n_obs[fid])):
+                        # update last n when it was updated
+                        self.last_n_obs[fid] = n_obs
+                        # initialize hyper-parameters using lower fidelity
+                        self.model[fid].set_hyperparams(self.model[self.num_of_fidelities - 1].current_hyperparams())
+                        # train hyper-parameters
+                        self.model[fid].optim_hyperparams(train_only_outputscale_and_noise = True)
+                        # set new hyper-parameters
+                        self.gp_hyperparams[fid] = self.model[fid].current_hyperparams()
         # update current temperature and time
         self.current_time = self.current_time + 1
     
@@ -257,6 +339,44 @@ class mfLiveBatch():
                     mu_norm = torch.norm(mu_grads, dim = 1)
                     # choose the largest one as our estimate
                     self.lipschitz_constant[i] = max(mu_norm).item()
+    
+    def calculate_local_lipschitz(self, pen_point, fid):
+        # if there is no model yet, use the prior
+        if self.X[fid] != []:
+            pass
+        else:
+            return self.lipschitz_constant[fid]
+
+        with torch.no_grad():
+            # first center grid around pen_point
+            grid = torch.tensor(self.lipschitz_grid)
+            # now scale the grid by the lengthscales
+            if self.X[fid] != []:
+                hypers = self.model[fid].current_hyperparams()
+            else:
+                hypers = self.gp_hyperparams[fid]
+            
+            lengthscale = hypers[1]
+            # multiply grid by lengthscales and center
+            grid = (grid - grid[0]) * lengthscale + pen_point
+            # clamp grid in the correct bounds
+            bounds = torch.stack([torch.zeros(self.dim), torch.ones(self.dim)])
+            for j, (lb, ub) in enumerate(zip(*bounds)):
+                grid.data[..., j].clamp_(lb, ub)
+
+        # finally estimate lipschitz constant
+        grid = grid.clone().detach().double().requires_grad_(True)
+        # calculate mean of the GP
+        mean, _ = self.model[fid].posterior(grid)
+        # calculate the gradient of the mean
+        external_grad = torch.ones(self.num_of_grad_points)
+        mean.backward(gradient = external_grad)
+        mu_grads = grid.grad
+        # find the norm of all the mean gradients
+        mu_norm = torch.norm(mu_grads, dim = 1)
+        # choose the largest one as our estimate
+        lipschitz_constant = max(mu_norm).item()
+        return lipschitz_constant
 
     def update_model_bias(self, update_set):
         '''
@@ -267,7 +387,7 @@ class mfLiveBatch():
                 i = int(i)
                 # fit new bias models
                 hypers_function = list(self.model[i].current_hyperparams())
-                hypers = ((self.bias_list[i] * self.bias_constant / self.beta)**2, hypers_function[1], 1e-3, 0)
+                hypers = ((self.bias_list[i] * self.bias_constant / self.beta[i])**2, hypers_function[1], 1e-3, 0)
                 self.bias_model[i].fit_model(self.bias_X[i], self.bias_Y[i], previous_hyperparams=hypers)
 
     def build_af(self, X):
@@ -275,8 +395,8 @@ class mfLiveBatch():
         This takes input locations, X, and returns the value of the acquisition function
         '''
         # check the batch of points being evaluated
-        batch = self.env.query_list
-        batch_fids = self.env.fidelities_list
+        batch = self.current_batch.copy()
+        batch_fids = self.current_batch_fids.copy()
         # initialize ucb
         ucb_shape = (self.num_of_fidelities, X.shape[0])
         ucb = torch.zeros(size = ucb_shape)
@@ -294,10 +414,10 @@ class mfLiveBatch():
             if self.bias_X[i] != []:
                 mean_bias, std_bias = self.bias_model[i].posterior(X)
             else:
-                mean_bias, std_bias = torch.tensor(0), torch.tensor(self.bias_list[i] * self.bias_constant) / self.beta
-            ucb_bias = mean_bias + self.beta * std_bias
+                mean_bias, std_bias = torch.tensor(0), torch.tensor(self.bias_list[i] * self.bias_constant) / self.beta[i]
+            ucb_bias = mean_bias + self.beta[i] * std_bias
             # calculate total upper confidence bound
-            ucb[i, :] = mean + self.beta * std + ucb_bias
+            ucb[i, :] = mean + self.beta[i] * std + ucb_bias
         # apply softmax transform if necessary
         if self.soft_plus_transform:
             ucb = torch.log(1 + torch.exp(ucb))
@@ -316,8 +436,8 @@ class mfLiveBatch():
                 constant = hypers[0]
                 mean_pp, std_pp = torch.tensor(mean_constant), torch.tensor(constant)
             # calculate values of r_j
-            r_j = (self.max_value[fidelity] - mean_pp) / self.lipschitz_constant[fidelity]
-            denominator = r_j + self.penalization_gamma * std_pp / self.lipschitz_constant[fidelity]
+            r_j = (self.max_value[fidelity] - mean_pp) / self.lipschitz_batch_list[i]
+            denominator = r_j + self.penalization_gamma * std_pp / self.lipschitz_batch_list[i]
             # calculate norm between x and penalty point
             norm = torch.norm(penalty_point - X, dim = 1)
             # define penaliser
@@ -338,6 +458,54 @@ class mfLiveBatch():
             new_M = np.array(self.num_of_fidelities - 1).reshape(1, 1)
             return new_X, new_M
         
+        # if we are simply optimizing with grid search, to be used when there are constraints
+        if self.grid_search is True:
+            with torch.no_grad():
+                # generate search grid
+                if self.grid_to_search == None:
+                    self.grid_to_search = self.env.func.gen_search_grid(2500 * self.num_of_starts * self.dim)
+                X = self.grid_to_search.clone()
+                # check acquisition function in grid
+                af = self.build_af(X)
+                # choose the best point
+                best_idx = torch.argmax(af)
+            # return the best value in the grid
+            best_input = X[best_idx, :].detach()
+            best = best_input.detach().numpy().reshape(1, -1)
+            new_X = best.reshape(1, -1)
+            # choose fidelity level for this point
+            for i in reversed(range(self.num_of_fidelities)):
+                # set fidelity
+                new_M = np.array(i).reshape(1, 1)
+                # if we reach target fidelity, break
+                if i == 0:
+                    break
+                # if there is data use posterior, else use prior
+                if self.X[i] != []:
+                    _, std = self.model[i].posterior(new_X)
+                else:
+                    hypers = self.gp_hyperparams[i]
+                    mean_constant = hypers[3]
+                    constant = hypers[0]
+                    _, std = torch.tensor(mean_constant), torch.tensor(constant)
+                
+                # check fidelity thresholds
+                threshold = self.beta[i] * std
+                if threshold > self.fidelity_thresholds[i]:
+                    break
+
+            new_M_int = int(new_M)
+            self.fidelity_count_list[new_M_int] = self.fidelity_count_list[new_M_int] + 1
+            if new_M_int != self.num_of_fidelities - 1:
+                self.fidelity_count_list[new_M_int + 1] = 0
+            
+            if (self.fidelity_count_list[new_M_int] > self.cost_thresholds[new_M_int]) & (new_M_int != 0):
+                # self.fidelity_thresholds[new_M_int] = self.fidelity_thresholds[new_M_int] + self.fidelity_thresholds_init[new_M_int] * self.dim
+                self.fidelity_thresholds[new_M_int] = self.fidelity_thresholds[new_M_int] * 2
+                self.fidelity_count_list[new_M_int] = 0
+
+            return new_X, new_M
+
         # optimisation bounds
         bounds = torch.stack([torch.zeros(self.dim), torch.ones(self.dim)])
         # sobol initialization initialization, on 100 * num_of_starts, check for best 10 and optimize from there
@@ -397,7 +565,11 @@ class mfLiveBatch():
                 _, std = torch.tensor(mean_constant), torch.tensor(constant)
             
             # check fidelity thresholds
-            threshold = self.beta * std
+            if self.increasing_thresholds:
+                threshold = self.beta[i] * std
+            else:
+                threshold = std
+
             if threshold > self.fidelity_thresholds[i]:
                 break
         
@@ -414,16 +586,17 @@ class mfLiveBatch():
         return new_X, new_M
 
 class UCBwILP(mfLiveBatch):
-    def __init__(self, env, beta=None, fidelity_thresholds=None, lipschitz_constant=1, num_of_starts=75, num_of_optim_epochs=25, hp_update_frequency=None, budget=10, cost_budget=4, initial_bias=0):
+    def __init__(self, env, beta=None, fidelity_thresholds=None, lipschitz_constant=1, num_of_starts=75, num_of_optim_epochs=25, hp_update_frequency=None, budget=10, cost_budget=4, initial_bias=0, local_lipschitz = True):
         super().__init__(env, beta, fidelity_thresholds, lipschitz_constant, num_of_starts, num_of_optim_epochs, hp_update_frequency, budget, cost_budget, initial_bias)
         self.num_of_fidelities = 1
+        self.local_lipschitz = local_lipschitz
 
 class mfUCB(mfLiveBatch):
     '''
     Class for Multi-Fidelity Upper Confidence Bound Bayesian Optimization model. This is a sequential method that takes advantage of multi-fidelity measurements.
     '''
-    def __init__(self, env, beta=None, fidelity_thresholds=None, lipschitz_constant=1, num_of_starts=75, num_of_optim_epochs=25, hp_update_frequency=None, budget=10, cost_budget=4, initial_bias=0):
-        super().__init__(env, beta, fidelity_thresholds, lipschitz_constant, num_of_starts, num_of_optim_epochs, hp_update_frequency, budget, cost_budget, initial_bias)
+    def __init__(self, env, beta=None, fidelity_thresholds=None, lipschitz_constant=1, num_of_starts=75, num_of_optim_epochs=25, hp_update_frequency=None, budget=10, cost_budget=4, initial_bias=0, increasing_thesholds = False):
+        super().__init__(env, beta, fidelity_thresholds, lipschitz_constant, num_of_starts, num_of_optim_epochs, hp_update_frequency, budget, cost_budget, initial_bias, increasing_thresholds=increasing_thesholds)
         self.query_being_evaluated = False
         # costs thresholds to double the fidelity thresholds
         self.cost_thresholds = [0] + [self.env.func.expected_costs[i] / self.env.func.expected_costs[i +1] \
@@ -435,7 +608,9 @@ class mfUCB(mfLiveBatch):
         '''
         # check if we need to update beta
         if self.fixed_beta == False:
-            self.beta = float(0.2 * self.dim * np.log(2 * (self.env.current_time + 1)))
+            beta = float(0.2 * self.dim * np.log(2 * (self.current_time + 1) / (self.env.func.expected_costs[0])))
+            self.beta = [beta for _ in range(self.num_of_fidelities)]
+
         # optimise acquisition function if no function is being evaluated
         new_Xs = np.empty((0, self.dim))
         new_Ms = np.empty((0, 1))
@@ -480,7 +655,7 @@ class mfUCB(mfLiveBatch):
                     f_high_fid_obs = self.new_obs[i]
                     # check if difference is higher than expected
                     diff = float(f_high_fid_obs - f_low_fid_pred)
-                    if diff > self.bias_constant:
+                    if (diff > self.bias_constant) & (self.update_max_bias):
                         self.bias_constant = 1.2 * diff
                 # take away batch cost
                 self.batch_costs = self.batch_costs - self.env.func.fidelity_costs[fid]
@@ -492,11 +667,54 @@ class mfUCB(mfLiveBatch):
             self.query_being_evaluated = False
         
         # update hyperparams if needed
-        if (self.hp_update_frequency is not None) & (len(self.X[self.num_of_fidelities - 1]) > 0):
-            if len(self.X[self.num_of_fidelities - 1]) % self.hp_update_frequency == 0:
-                self.model[self.num_of_fidelities - 1].optim_hyperparams()
-                for fid2 in range(self.num_of_fidelities):
-                    self.gp_hyperparams[fid2] = self.model[self.num_of_fidelities - 1].current_hyperparams()
+        # if there is only one fidelity, simple case
+        if self.num_of_fidelities == 1:
+            n_obs = 0
+            for fid in range(self.num_of_fidelities):
+                n_obs = n_obs + len(self.X[fid])
+
+            if (self.hp_update_frequency is not None) & (len(self.X[0]) > 0):
+                if (n_obs >= (self.hp_update_frequency + self.last_n_obs[0])):
+                    self.last_n_obs[fid] = n_obs
+                    self.model[0].optim_hyperparams()
+                    self.gp_hyperparams[0] = self.model[0].current_hyperparams()
+        # multi-fidelity case is more complicated. We use the lowest fidelity as the base for our initializations
+        else:
+            # first fidelity is special, as we might retrain all other models as well
+            if (self.hp_update_frequency is not None) & (len(self.X[self.num_of_fidelities - 1]) > 0):
+                n_obs = len(self.X[self.num_of_fidelities - 1])
+                # check if enough observations have passed since last time
+                if (n_obs >= (self.hp_update_frequency + self.last_n_obs[self.num_of_fidelities - 1])):
+                    # update n on last update
+                    self.last_n_obs[self.num_of_fidelities - 1] = n_obs
+                    # optimize hyperparameters
+                    self.model[self.num_of_fidelities - 1].optim_hyperparams()
+                    self.gp_hyperparams[self.num_of_fidelities - 1] = self.model[self.num_of_fidelities - 1].current_hyperparams()
+                    # for fid2 in range(self.num_of_fidelities - 1):
+                        # obtain hyperparameters of lower model
+                        # self.gp_hyperparams[fid2] = self.model[self.num_of_fidelities - 1].current_hyperparams()
+                        # if we have enough observations for the other fidelities, retrain those as well but not the prior mean constant
+                        # if len(self.X[fid2]) > 10:
+                        #     self.model[fid2].set_hyperparams(self.model[self.num_of_fidelities - 1].current_hyperparams())
+                        #    self.model[fid2].optim_hyperparams(train_only_outputscale_and_noise = True)
+                        #    self.gp_hyperparams[fid2] = self.model[fid2].current_hyperparams()
+            
+            # we further train the hyper-parameters whenever we reach the correct number of new observations for each fidelity
+            for fid in range(self.num_of_fidelities - 1):
+                # obtain number of observations
+                n_obs = len(self.X[fid])
+                # update the hyper-parameters if there are enough new observations
+                if (self.hp_update_frequency is not None) & (len(self.X[fid]) > 0):
+                    if (n_obs >= (self.hp_update_frequency + self.last_n_obs[fid])):
+                        # update last n when it was updated
+                        self.last_n_obs[fid] = n_obs
+                        # initialize hyper-parameters using lower fidelity
+                        self.model[fid].set_hyperparams(self.model[self.num_of_fidelities - 1].current_hyperparams())
+                        # train hyper-parameters
+                        self.model[fid].optim_hyperparams(train_only_outputscale_and_noise = True)
+                        # set new hyper-parameters
+                        self.gp_hyperparams[fid] = self.model[fid].current_hyperparams()
+        
         # update current temperature and time
         self.current_time = self.current_time + 1
     
@@ -520,7 +738,7 @@ class mfUCB(mfLiveBatch):
                 constant = hypers[0]
                 mean, std = torch.tensor(mean_constant), torch.tensor(constant)
             # calculate upper confidence bound
-            ucb[i, :] = mean + self.beta * std + self.bias_list[i] * self.bias_constant
+            ucb[i, :] = mean + self.beta[i] * std + self.bias_list[i] * self.bias_constant
         
         # return acquisition function
         min_ucb, _ = torch.min(ucb, dim = 0)
@@ -536,6 +754,53 @@ class mfUCB(mfLiveBatch):
             new_M = np.array(self.num_of_fidelities - 1).reshape(1, 1)
             return new_X, new_M
         
+        # if we are simply optimizing with grid search, to be used when there are constraints
+        if self.grid_search is True:
+            with torch.no_grad():
+                if self.grid_to_search == None:
+                    self.grid_to_search = self.env.func.gen_search_grid(2500 * self.num_of_starts * self.dim)
+                X = self.grid_to_search.clone()
+                # check acquisition function in grid
+                af = self.build_af(X)
+                # choose the best point
+                best_idx = torch.argmax(af)
+            # return the best value in the grid
+            best_input = X[best_idx, :].detach()
+            best = best_input.detach().numpy().reshape(1, -1)
+            new_X = best.reshape(1, -1)
+            # choose fidelity level for this point
+            for i in reversed(range(self.num_of_fidelities)):
+                # set fidelity
+                new_M = np.array(i).reshape(1, 1)
+                # if we reach target fidelity, break
+                if i == 0:
+                    break
+                # if there is data use posterior, else use prior
+                if self.X[i] != []:
+                    _, std = self.model[i].posterior(new_X)
+                else:
+                    hypers = self.gp_hyperparams[i]
+                    mean_constant = hypers[3]
+                    constant = hypers[0]
+                    _, std = torch.tensor(mean_constant), torch.tensor(constant)
+                
+                # check fidelity thresholds
+                threshold = self.beta[i] * std
+                if threshold > self.fidelity_thresholds[i]:
+                    break
+
+            new_M_int = int(new_M)
+            self.fidelity_count_list[new_M_int] = self.fidelity_count_list[new_M_int] + 1
+            if new_M_int != self.num_of_fidelities - 1:
+                self.fidelity_count_list[new_M_int + 1] = 0
+            
+            if (self.fidelity_count_list[new_M_int] > self.cost_thresholds[new_M_int]) & (new_M_int != 0):
+                # self.fidelity_thresholds[new_M_int] = self.fidelity_thresholds[new_M_int] + self.fidelity_thresholds_init[new_M_int] * self.dim
+                self.fidelity_thresholds[new_M_int] = self.fidelity_thresholds[new_M_int] * 2
+                self.fidelity_count_list[new_M_int] = 0
+
+            return new_X, new_M
+
         # optimisation bounds
         bounds = torch.stack([torch.zeros(self.dim), torch.ones(self.dim)])
         
@@ -594,9 +859,12 @@ class mfUCB(mfLiveBatch):
                 mean_constant = hypers[3]
                 constant = hypers[0]
                 _, std = torch.tensor(mean_constant), torch.tensor(constant)
-
             # check fidelity thresholds
-            threshold = self.beta * std
+            if self.increasing_thresholds:
+                threshold = self.beta[i] * std
+            else:
+                threshold = std
+            
             if threshold > self.fidelity_thresholds[i]:
                 break
         
@@ -629,7 +897,8 @@ class mfUCBPlus(mfLiveBatch):
         '''
         # check if we need to update beta
         if self.fixed_beta == False:
-            self.beta = float(0.2 * self.dim * np.log(2 * (self.env.current_time + 1)))
+            for fid in self.num_of_fidelities:
+                self.beta[fid] = float(0.2 * self.dim * np.log(2 * (len(self.X[fid]) + 1)))
         # optimise acquisition function if no function is being evaluated
         new_Xs = np.empty((0, self.dim))
         new_Ms = np.empty((0, 1))
@@ -735,10 +1004,10 @@ class mfUCBPlus(mfLiveBatch):
             if self.bias_X[i] != []:
                 mean_bias, std_bias = self.bias_model[i].posterior(X)
             else:
-                mean_bias, std_bias = torch.tensor(0), torch.tensor(self.bias_list[i] * self.bias_constant) / self.beta
-            ucb_bias = mean_bias + self.beta * std_bias
+                mean_bias, std_bias = torch.tensor(0), torch.tensor(self.bias_list[i] * self.bias_constant) / self.beta[i]
+            ucb_bias = mean_bias + self.beta[i] * std_bias
             # calculate upper confidence bound
-            ucb[i, :] = mean + self.beta * std + ucb_bias
+            ucb[i, :] = mean + self.beta[i] * std + ucb_bias
         
         # return acquisition function
         min_ucb, _ = torch.min(ucb, dim = 0)
@@ -748,3 +1017,452 @@ class simpleUCB(mfUCB):
     def __init__(self, env, beta=None, fidelity_thresholds=None, lipschitz_constant=1, num_of_starts=75, num_of_optim_epochs=25, hp_update_frequency=None, budget=10, cost_budget=4, initial_bias=0):
         super().__init__(env, beta, fidelity_thresholds, lipschitz_constant, num_of_starts, num_of_optim_epochs, hp_update_frequency, budget, cost_budget, initial_bias)
         self.num_of_fidelities = 1
+
+class MultiTaskUCBwILP():
+    def __init__(self, env, budget, cost_budget, num_of_latents = None, ranks = None, hp_update_frequency = None, num_of_starts = 75, num_of_optim_epochs = 25, beta = None, local_lipschitz = True, fidelity_thresholds = None, increasing_thresholds = False):
+        '''
+        Takes as inputs:
+        env - optimization environment
+        num_of_starts - number of multi-starts for optimizing the acquisition function, default is 75
+        num_of_optim_epochs - number of epochs for optimizing the acquisition function, default is 150
+        hp_update_frequency - how ofter should GP hyper-parameters be re-evaluated, default is None
+        '''
+        # initialise the environment
+        self.env = env
+        self.dim = env.dim
+
+        # initialize the maximum fidelity cost
+        self.cost_budget = cost_budget
+        # initialize budgets
+        self.batch_costs = 0
+        self.budget = budget
+
+        # multifidelity parameters
+        self.num_of_fidelities = self.env.num_of_fidelities
+        self.increasing_thresholds = increasing_thresholds
+
+        # LCM parameters
+        # number of latent functions
+        if num_of_latents is None:
+            self.num_of_latents = self.env.num_of_fidelities * 2
+        else:
+            self.num_of_latents = num_of_latents
+        # rank of each latent function
+        if ranks is None:
+            self.ranks = [self.num_of_fidelities for _ in range(self.num_of_latents)]
+        else:
+            self.ranks = [ranks for _ in range(self.num_of_latents)]
+        
+        # gp initial hyperparams
+        self.set_hyperparams()
+
+        # af optimization parameters
+        if beta is None:
+            self.fixed_beta = False
+            self.beta = float(0.2 * self.dim * np.log(2 * (1) / (self.env.func.expected_costs[0])))
+        else:
+            self.fixed_beta = True
+            self.beta = beta
+        # initialize local penalization parameters
+        self.local_lipschitz = local_lipschitz
+        self.max_value = -10
+        self.lipschitz_constant = 1
+        self.penalization_gamma = 1
+        # initialize grid to select lipschitz constant
+        self.estimate_lipschitz = True
+        self.num_of_grad_points = 50 * self.dim
+        self.lipschitz_grid = sobol_seq.i4_sobol_generate(self.dim, self.num_of_grad_points)
+        # acquisition function optimization parameters
+        self.num_of_starts = num_of_starts
+        self.num_of_optim_epochs = num_of_optim_epochs
+        self.grid_search = False
+        self.grid_to_search = None
+        # hp hyperparameters update frequency
+        self.hp_update_frequency = hp_update_frequency
+        self.last_n_obs = 0
+        # multifidelity parameters
+        if fidelity_thresholds is None:
+            self.fidelity_thresholds = [0.1 for _ in range(self.num_of_fidelities)]
+        else:
+            self.fidelity_thresholds = fidelity_thresholds
+
+        # define domain
+        self.domain = np.zeros((self.dim,))
+        self.domain = np.stack([self.domain, np.ones(self.dim, )], axis=1)
+        
+        self.initialise_stuff()
+    
+    def initialise_stuff(self):
+        # list of queries
+        self.queried_batch = [[]] * self.num_of_fidelities
+        # list of queries and observations
+        self.X = [[] for _ in range(self.num_of_fidelities)]
+        self.Y = [[] for _ in range(self.num_of_fidelities)]
+        # list of times at which we obtained the observations
+        self.T = [[] for _ in range(self.num_of_fidelities)]
+        # define model
+        self.model = MultiTaskBoTorchGP(num_of_tasks = self.num_of_fidelities, num_of_latents = self.num_of_latents, ranks = self.ranks, lengthscale_dim = self.dim)
+        # time
+        self.current_time = 0
+        # initialise new_obs
+        self.new_obs = None
+
+    def set_hyperparams(self, constant = None, lengthscale = None, noise = None, mean_constant = None, constraints = False):
+        '''
+        This function is used to set the hyper-parameters of the GP.
+        INPUTS:
+        constant: positive float, multiplies the RBF kernel and defines the initital variance
+        lengthscale: tensor of positive floats of length (dim), defines the kernel of the rbf kernel
+        noise: positive float, noise assumption
+        mean_constant: float, value of prior mean
+        constraints: boolean, if True, we will apply constraints from paper based on the given hyperparameters
+        '''
+        if constant == None:
+            self.constant = 0.6
+            self.length_scale = torch.tensor([0.15 for _ in range(self.dim)])
+            self.noise = 1e-4
+            self.mean_constant = 0
+        else:
+            self.constant = constant
+            self.length_scale = lengthscale
+            self.noise = noise
+            self.mean_constant = mean_constant
+        
+        hypers = {}
+        for latent in range(self.num_of_latents):
+            parameter_key_lengthscale = 'covar_module_' + str(latent) + '.lengthscale'
+            parameter_key_variance = 'task_covar_module_' + str(latent) + '.var'
+            hypers[parameter_key_lengthscale] = self.length_scale.clone()
+            hypers[parameter_key_variance] = torch.tensor([self.constant for _ in range(self.num_of_fidelities)])
+        hypers['likelihood.noise'] = torch.tensor([self.noise for _ in range(self.num_of_fidelities)])
+        hypers['mean_module.constant'] = torch.tensor(self.mean_constant)
+
+        self.gp_hyperparams = hypers
+        # check if we want our constraints based on these hyperparams
+        if constraints is True:
+            self.model.define_constraints(self.length_scale, self.mean_constant, self.constant)
+
+    def run_optim(self, verbose = False):
+        '''
+        Runs the whole optimisation procedure, returns all queries and evaluations
+        '''
+        # self.env.initialise_optim()
+        while self.current_time <= self.budget - 1:
+            self.optim_loop()
+            if verbose:
+                print(f'Current time-step: {self.current_time}')
+        # obtain all queries
+        X, M, Y = self.env.finished_with_optim()
+        # reformat all queries before returning
+        num_of_remaining_queries = X.shape[0]
+        for i in range(num_of_remaining_queries):
+            fid = int(M[i, :])
+            self.X[fid].append(list(X[i, :].reshape(1, -1)))
+            self.Y[fid].append(Y[i])
+            self.T[fid].append(self.current_time + 1)
+        return self.X, self.Y, self.T
+    
+    def optim_loop(self):
+        '''
+        Performs a single loop of the optimisation
+        '''
+        # check if we need to update beta
+        if self.fixed_beta == False:
+            self.beta = float(0.2 * self.dim * np.log(2 * (self.current_time + 1) / (self.env.func.expected_costs[0])))
+        # optimise acquisition function to obtain new queries until batch is full
+        new_Xs = np.empty((0, self.dim))
+        new_Ms = np.empty((0, 1))
+        
+        self.lipschitz_batch_list = []
+        # obtain current batch
+        self.current_batch = self.env.query_list.copy()
+        # check lipschitz constant
+        if self.local_lipschitz:
+            for i, penalty_point in enumerate(self.current_batch):
+                penalty_point = penalty_point.reshape(1, -1)
+                # re-define penalty point as tensor
+                penalty_point = torch.tensor(penalty_point)
+                # calculate local lipschitz constant
+                local_lip_constant = self.calculate_local_lipschitz(penalty_point)
+                self.lipschitz_batch_list.append(local_lip_constant)
+        else:
+            # otherwise simply append the global lipschitz constant for each fidelity
+            batch = self.env.query_list
+            for i, penalty_point in enumerate(batch):
+                self.lipschitz_batch_list.append(self.lipschitz_constant)
+
+        # fill batch
+        while self.batch_costs < self.cost_budget:
+            self.lipshitz_batch_list = []
+            new_X, new_M = self.optimise_af()
+            new_Xs = np.concatenate((new_Xs, new_X))
+            new_Ms = np.concatenate((new_Ms, new_M))
+            # add new_X and new_M to current batch
+            self.current_batch = np.concatenate((self.current_batch, new_X))
+            # update batch costs
+            self.batch_costs = self.batch_costs + self.env.func.fidelity_costs[int(new_M)]
+            # if loop is not going to break, add new lipschitz constant
+            if self.batch_costs < self.cost_budget:
+                # new_X defines the penalty point
+                penalty_point = torch.tensor(new_X)
+                # calculate local lipschitz constant
+                local_lip_constant = self.calculate_local_lipschitz(penalty_point)
+                self.lipschitz_batch_list.append(local_lip_constant)
+
+        obtain_query, obtain_fidelities, self.new_obs = self.env.step(new_Xs, new_Ms)
+
+        # update model if there are new observations
+        if self.new_obs is not None:
+            num_of_obs = obtain_query.shape[0]
+
+            for i in range(num_of_obs):
+                # append new observations and the time at which they were observed
+                fid = int(obtain_fidelities[i])
+                self.X[fid].append(list(obtain_query[i, :].reshape(-1)))
+                self.Y[fid].append(self.new_obs[i])
+                self.T[fid].append(self.current_time + 1)
+                # redefine new maximum value
+                self.max_value = float(max(self.max_value, float(self.new_obs[i])))
+                # take away batch cost
+                self.batch_costs = self.batch_costs - self.env.func.fidelity_costs[fid]
+
+            # check which model need to be updated according to the fidelities
+            self.update_model()
+        
+        # calculate total number of observations
+        n_obs = 0
+        for fid in range(self.num_of_fidelities):
+            n_obs = n_obs + len(self.X[fid])
+
+        if (self.hp_update_frequency is not None) & (len(self.X[-1]) > 0):
+            if (n_obs >= (self.hp_update_frequency + self.last_n_obs)):
+                self.last_n_obs = n_obs
+                self.model.optim_hyperparams()
+                self.gp_hyperparams = self.model.current_hyperparams()
+        
+        # update current temperature and time
+        self.current_time = self.current_time + 1
+    
+    def update_model(self):
+        '''
+        This function updates the GP model
+        '''
+        if self.new_obs is not None:
+            # fit new model
+            self.model.fit_model(self.X, self.Y, previous_hyperparams=self.gp_hyperparams)
+            # we also update our estimate of the lipschitz constant, since we have a new model
+            # define the grid over which we will calculate gradients
+            grid = torch.tensor(self.lipschitz_grid, requires_grad = True).double()
+            # estimate global lipschitz, we only do this if we are in asynchronous setting, otherwise this should behave as normal UCB algorithm
+            if self.estimate_lipschitz == True:
+                # calculate mean of the GP
+                target_i = torch.zeros(size = (grid.shape[0], 1))
+                mean, _ = self.model.posterior(grid, target_i)
+                # calculate the gradient of the mean
+                external_grad = torch.ones(self.num_of_grad_points)
+                mean.backward(gradient = external_grad)
+                mu_grads = grid.grad
+                # find the norm of all the mean gradients
+                mu_norm = torch.norm(mu_grads, dim = 1)
+                # choose the largest one as our estimate
+                self.lipschitz_constant = max(mu_norm).item()
+
+    def calculate_local_lipschitz(self, pen_point):
+        # if there is no model yet, use the prior
+        if self.X[-1] != []:
+            pass
+        else:
+            return self.lipschitz_constant
+
+        with torch.no_grad():
+            # first center grid around pen_point
+            grid = torch.tensor(self.lipschitz_grid)
+            # now scale the grid by the lengthscales
+            if self.X[-1] != []:
+                lengthscale = self.model.model.covar_module_0.lengthscale.detach()
+            else:
+                hypers = self.gp_hyperparams
+                lengthscale = hypers[1]
+            # multiply grid by lengthscales and center
+            grid = (grid - grid[0]) * lengthscale + pen_point
+            # clamp grid in the correct bounds
+            bounds = torch.stack([torch.zeros(self.dim), torch.ones(self.dim)])
+            for j, (lb, ub) in enumerate(zip(*bounds)):
+                grid.data[..., j].clamp_(lb, ub)
+
+        # finally estimate lipschitz constant
+        grid = grid.clone().detach().double().requires_grad_(True)
+        target_task_i = torch.zeros(size = (grid.shape[0], 1))
+        # calculate mean of the GP
+        mean, _ = self.model.posterior(grid, target_task_i)
+        # calculate the gradient of the mean
+        external_grad = torch.ones(self.num_of_grad_points)
+        mean.backward(gradient = external_grad)
+        mu_grads = grid.grad
+        # find the norm of all the mean gradients
+        mu_norm = torch.norm(mu_grads, dim = 1)
+        # choose the largest one as our estimate
+        lipschitz_constant = max(mu_norm).item()
+        return lipschitz_constant
+    
+    def build_af(self, X):
+        '''
+        This takes input locations, X, and returns the UCB at the target fidelity
+        '''
+        # we focus on the target task
+        target_task_i = torch.zeros(size = (X.shape[0], 1))
+        # calculate ucb
+        mean, std = self.model.posterior(X, target_task_i)
+        ucb = mean + self.beta * std
+        # check the batch of points being evaluated
+        batch = self.current_batch.copy()
+        # penalize acquisition function, loop through batch of evaluations
+        for i, penalty_point in enumerate(batch):
+            penalty_point = penalty_point.reshape(1, -1)
+            # re-define penalty point as tensor
+            penalty_point = torch.tensor(penalty_point)
+            # calculate mean and variance of model at penalty point
+            if self.X[-1] != []:
+                mean_pp, std_pp = self.model.posterior(penalty_point, torch.tensor(0).reshape(1, 1))
+            else:
+                hypers = self.gp_hyperparams
+                mean_constant = hypers[3]
+                constant = hypers[0]
+                mean_pp, std_pp = torch.tensor(mean_constant), torch.tensor(constant)
+            # calculate values of r_j
+            r_j = (self.max_value - mean_pp) / self.lipschitz_batch_list[i]
+            denominator = r_j + self.penalization_gamma * std_pp / self.lipschitz_batch_list[i]
+            # calculate norm between x and penalty point
+            norm = torch.norm(penalty_point - X, dim = 1)
+            # define penaliser
+            penaliser = torch.min(norm / denominator, torch.tensor(1))
+            # penalise ucb
+            ucb = ucb * penaliser
+        return ucb
+
+    def optimise_af(self):
+        '''
+        This function optimizes the acquisition function, and returns the next query point
+        '''
+        # if time is zero, pick point at random, lowest fidelity
+        if self.current_time == 0:
+            new_X = np.random.uniform(size = self.dim).reshape(1, -1)
+            new_M = np.array(self.num_of_fidelities - 1).reshape(1, 1)
+            return new_X, new_M
+        
+        # if we are simply optimizing with grid search, to be used when there are constraints
+        if self.grid_search is True:
+            with torch.no_grad():
+                # generate search grid
+                if self.grid_to_search == None:
+                    self.grid_to_search = self.env.func.gen_search_grid(2500 * self.num_of_starts * self.dim)
+                X = self.grid_to_search.clone()
+                # check acquisition function in grid
+                af = self.build_af(X)
+                # choose the best point
+                best_idx = torch.argmax(af)
+            # return the best value in the grid
+            best_input = X[best_idx, :].detach()
+            best = best_input.detach().numpy().reshape(1, -1)
+            new_X = best.reshape(1, -1)
+            # choose fidelity level for this point
+            for i in reversed(range(self.num_of_fidelities)):
+                # set fidelity
+                new_M = np.array(i).reshape(1, 1)
+                # if we reach target fidelity, break
+                if i == 0:
+                    break
+                # if there is data use posterior, else use prior
+                if self.X[i] != []:
+                    _, std = self.model.posterior(new_X, torch.tensor([i]).reshape(1, 1))
+                else:
+                    hypers = self.gp_hyperparams[i]
+                    mean_constant = hypers[3]
+                    constant = hypers[0]
+                    _, std = torch.tensor(mean_constant), torch.tensor(constant)
+                
+                # check fidelity thresholds
+                threshold = self.beta * std
+                if threshold > self.fidelity_thresholds[i]:
+                    break
+
+            new_M_int = int(new_M)
+            self.fidelity_count_list[new_M_int] = self.fidelity_count_list[new_M_int] + 1
+            if new_M_int != self.num_of_fidelities - 1:
+                self.fidelity_count_list[new_M_int + 1] = 0
+            
+            if (self.fidelity_count_list[new_M_int] > self.cost_thresholds[new_M_int]) & (new_M_int != 0):
+                # self.fidelity_thresholds[new_M_int] = self.fidelity_thresholds[new_M_int] + self.fidelity_thresholds_init[new_M_int] * self.dim
+                self.fidelity_thresholds[new_M_int] = self.fidelity_thresholds[new_M_int] * 2
+                self.fidelity_count_list[new_M_int] = 0
+
+            return new_X, new_M
+
+        # optimisation bounds
+        bounds = torch.stack([torch.zeros(self.dim), torch.ones(self.dim)])
+        # sobol initialization initialization, on 100 * num_of_starts, check for best 10 and optimize from there
+        sobol_gen = torch.quasirandom.SobolEngine(self.dim, scramble = True)
+        X = sobol_gen.draw(100 * self.num_of_starts * self.dim).double()
+
+        with torch.no_grad():
+            af = self.build_af(X)
+            idx_list = list(range(0, self.num_of_starts * 100 * self.dim))
+            sorted_af_idx = [idx for _, idx in sorted(zip(af, idx_list))]
+            best_idx = sorted_af_idx[-10:]
+
+        # choose best starts for X
+        X = X[best_idx, :]
+        X.requires_grad = True
+        # define optimiser
+        optimiser = torch.optim.Adam([X], lr = 0.01)
+        af = self.build_af(X)
+        
+        # do the optimisation
+        for _ in range(self.num_of_optim_epochs):
+            # set zero grad
+            optimiser.zero_grad()
+            # losses for optimiser
+            losses = -self.build_af(X)
+            loss = losses.sum()
+            loss.backward()
+            # optim step
+            optimiser.step()
+
+            # make sure we are still within the bounds
+            for j, (lb, ub) in enumerate(zip(*bounds)):
+                X.data[..., j].clamp_(lb, ub)
+        
+        # find the best start
+        best_start = torch.argmax(-losses)
+
+        # corresponding best input
+        best_input = X[best_start, :].detach()
+        best = best_input.detach().numpy().reshape(1, -1)
+        new_X = best.reshape(1, -1)
+
+        # now choose the corresponding fidelity
+        for fidelity in reversed(range(self.num_of_fidelities)):
+            # set fidelity
+            new_M = torch.tensor(fidelity).reshape(1, 1)
+            # if we reach target fidelity, break
+            if fidelity == 0:
+                break
+            # if there is data use posterior, else use prior
+            if self.X[-1] != []:
+                _, std = self.model.posterior(new_X, new_M)
+            else:
+                hypers = self.gp_hyperparams
+                mean_constant = hypers[3]
+                constant = hypers[0]
+                _, std = torch.tensor(mean_constant), torch.tensor(constant)
+            # check fidelity thresholds
+            if self.increasing_thresholds:
+                threshold = self.beta * std
+            else:
+                threshold = std
+            if threshold > self.fidelity_thresholds[fidelity]:
+                break
+        
+        new_M_int = int(new_M)
+        
+        return new_X, new_M
