@@ -1,8 +1,10 @@
+import gpytorch
 import numpy as np
 import torch
 from gp_utils import MultiTaskBoTorchGP, BoTorchGP
 import sobol_seq
 from gpytorch.kernels import MaternKernel, ScaleKernel
+import time
 
 class mfLiveBatch():
     def __init__(self, env, beta = None, fidelity_thresholds = None, lipschitz_constant = 1, num_of_starts = 75, num_of_optim_epochs = 25, \
@@ -1176,20 +1178,7 @@ class MultiTaskUCBwILP():
         self.lipschitz_batch_list = []
         # obtain current batch
         self.current_batch = self.env.query_list.copy()
-        # check lipschitz constant
-        if self.local_lipschitz:
-            for i, penalty_point in enumerate(self.current_batch):
-                penalty_point = penalty_point.reshape(1, -1)
-                # re-define penalty point as tensor
-                penalty_point = torch.tensor(penalty_point)
-                # calculate local lipschitz constant
-                local_lip_constant = self.calculate_local_lipschitz(penalty_point)
-                self.lipschitz_batch_list.append(local_lip_constant)
-        else:
-            # otherwise simply append the global lipschitz constant for each fidelity
-            batch = self.env.query_list
-            for i, penalty_point in enumerate(batch):
-                self.lipschitz_batch_list.append(self.lipschitz_constant)
+        self.current_batch_fids = self.env.fidelities_list.copy()
 
         # fill batch
         while self.batch_costs < self.cost_budget:
@@ -1199,15 +1188,9 @@ class MultiTaskUCBwILP():
             new_Ms = np.concatenate((new_Ms, new_M))
             # add new_X and new_M to current batch
             self.current_batch = np.concatenate((self.current_batch, new_X))
+            self.current_batch_fids = np.concatenate((self.current_batch_fids, new_M))
             # update batch costs
             self.batch_costs = self.batch_costs + self.env.func.fidelity_costs[int(new_M)]
-            # if loop is not going to break, add new lipschitz constant
-            if self.batch_costs < self.cost_budget:
-                # new_X defines the penalty point
-                penalty_point = torch.tensor(new_X)
-                # calculate local lipschitz constant
-                local_lip_constant = self.calculate_local_lipschitz(penalty_point)
-                self.lipschitz_batch_list.append(local_lip_constant)
 
         obtain_query, obtain_fidelities, self.new_obs = self.env.step(new_Xs, new_Ms)
 
@@ -1239,6 +1222,7 @@ class MultiTaskUCBwILP():
                 self.last_n_obs = n_obs
                 self.model.optim_hyperparams()
                 self.gp_hyperparams = self.model.current_hyperparams()
+                print('Hyper-params Optimized')
         
         # update current temperature and time
         self.current_time = self.current_time + 1
@@ -1250,22 +1234,6 @@ class MultiTaskUCBwILP():
         if self.new_obs is not None:
             # fit new model
             self.model.fit_model(self.X, self.Y, previous_hyperparams=self.gp_hyperparams)
-            # we also update our estimate of the lipschitz constant, since we have a new model
-            # define the grid over which we will calculate gradients
-            grid = torch.tensor(self.lipschitz_grid, requires_grad = True).double()
-            # estimate global lipschitz, we only do this if we are in asynchronous setting, otherwise this should behave as normal UCB algorithm
-            if self.estimate_lipschitz == True:
-                # calculate mean of the GP
-                target_i = torch.zeros(size = (grid.shape[0], 1))
-                mean, _ = self.model.posterior(grid, target_i)
-                # calculate the gradient of the mean
-                external_grad = torch.ones(self.num_of_grad_points)
-                mean.backward(gradient = external_grad)
-                mu_grads = grid.grad
-                # find the norm of all the mean gradients
-                mu_norm = torch.norm(mu_grads, dim = 1)
-                # choose the largest one as our estimate
-                self.lipschitz_constant = max(mu_norm).item()
 
     def calculate_local_lipschitz(self, pen_point):
         # if there is no model yet, use the prior
@@ -1355,7 +1323,7 @@ class MultiTaskUCBwILP():
             with torch.no_grad():
                 # generate search grid
                 if self.grid_to_search == None:
-                    self.grid_to_search = self.env.func.gen_search_grid(2500 * self.num_of_starts * self.dim)
+                    self.grid_to_search = self.env.func.gen_search_grid(100 * self.num_of_starts * self.dim)
                 X = self.grid_to_search.clone()
                 # check acquisition function in grid
                 af = self.build_af(X)
@@ -1402,7 +1370,7 @@ class MultiTaskUCBwILP():
         bounds = torch.stack([torch.zeros(self.dim), torch.ones(self.dim)])
         # sobol initialization initialization, on 100 * num_of_starts, check for best 10 and optimize from there
         sobol_gen = torch.quasirandom.SobolEngine(self.dim, scramble = True)
-        X = sobol_gen.draw(100 * self.num_of_starts * self.dim).double()
+        X = sobol_gen.draw(100 * self.num_of_starts).double()
 
         with torch.no_grad():
             af = self.build_af(X)
@@ -1466,3 +1434,339 @@ class MultiTaskUCBwILP():
         new_M_int = int(new_M)
         
         return new_X, new_M
+
+class MF_MES(MultiTaskUCBwILP):
+    def __init__(self, env, budget, cost_budget, num_of_latents=None, ranks=None, hp_update_frequency=None, num_of_starts=75, num_of_optim_epochs=25, beta=None, local_lipschitz=True, fidelity_thresholds=None, increasing_thresholds=False):
+        super().__init__(env, budget, cost_budget, num_of_latents, ranks, hp_update_frequency, num_of_starts, num_of_optim_epochs, beta, local_lipschitz, fidelity_thresholds, increasing_thresholds)
+        self.min_integration = -10
+        self.max_integration = 10
+        self.num_of_integration_steps = 250
+        self.num_of_fantasies = 100
+        self.num_stability = 1e-30
+
+    def build_af(self, X, fidelity):
+        # X is batch size X dimension
+        # fidelity is an integer, since we must optimize separately across all fidelities
+        current_batch = torch.tensor(self.current_batch)
+        current_batch_fids = torch.tensor(self.current_batch_fids)
+        # batch size
+        batch_size = X.shape[0]
+        fidelity_vector = torch.full(size = (batch_size,), fill_value = fidelity)
+        # reshape the max samples for calculations
+        f_max_samples = self.f_max_samples.clone().reshape(1, -1).expand(batch_size, self.num_of_fantasies)
+        num_max_samples = self.f_max_samples.shape[0]
+        # initialize standard normal distribution
+        standard_normal = torch.distributions.Normal(loc = 0, scale = 1)
+        # if there is no batch being evaluated, do normal sequential MF-MSE
+        if self.current_batch.shape[0] == 0:
+            # calculate entropy of f(X, m) | D_t ; same procedure independently of fidelity
+            mu_m, sigma_m = self.model.posterior(X, fidelity_vector)
+            mu_m, sigma_m = mu_m.reshape(-1, 1), sigma_m.reshape(-1, 1)
+            H_1 = torch.log(sigma_m * torch.sqrt(2 * torch.pi * torch.exp(torch.tensor(1))))
+            # if we are querying target fidelity, use truncated normal approximation
+            if fidelity == 0:
+                # calculate expected entropy of f(X, m) | f_*, D_t
+                # calculate gamma
+                gamma = (f_max_samples - mu_m) / (sigma_m + 1e-7)
+                # cdf and pdf terms
+                cdf_term = standard_normal.cdf(gamma)
+                pdf_term = torch.exp(standard_normal.log_prob(gamma))
+                # finally calculate entropy
+                # make sure value inside log is non-zero for numerical stability using masked_fill
+                inner_log = torch.sqrt(2 * torch.pi * torch.exp(torch.tensor(1))) * sigma_m * cdf_term
+                log_term = torch.log(inner_log.masked_fill(inner_log <= 0, 1e-10))
+                # second term
+                second_term = gamma * pdf_term / (2 * cdf_term + 1e-10)
+                # finally take Monte Carlo Estimate
+                H_2_samples = log_term - second_term
+                H_2 = H_2_samples.mean(axis = 1).reshape(-1, 1)
+            
+            # if we are not querying target fidelity, we need integral approximation
+            elif fidelity != 0:
+                # define fidelity vectors
+                target_fidelity_vector = torch.zeros(size = (batch_size,))
+                joint_fidelity_vector = torch.concat((fidelity_vector, target_fidelity_vector))
+                # obtain joint covariance matrix
+                with gpytorch.settings.fast_pred_var():
+                    out = self.model.model(X.repeat(2, 1), joint_fidelity_vector)
+                    covar_matrix = out.lazy_covariance_matrix
+                # obtain target fidelity mean vector
+                mu_0, sigma_0 = self.model.posterior(X, target_fidelity_vector)
+                mu_0, sigma_0 = mu_0.reshape(-1, 1), sigma_0.reshape(-1, 1)
+                # obtain smaller covariance matrix
+                covar_matrix_mM = covar_matrix[:batch_size, batch_size:]
+                covar_matrix_MM = covar_matrix[batch_size:, batch_size:]
+                # obtain variances
+                sigma_mM_sqrd = covar_matrix_mM.diag().reshape(-1, 1)
+                sigma_M_sqrd = covar_matrix_MM.diag().reshape(-1, 1)
+                # define s^2
+                s_sqrd = sigma_M_sqrd - (sigma_mM_sqrd)**2 / (sigma_m**2 + 1e-9)
+                # now we can define Psi(x)
+                def Psi(f):
+                    u_x = mu_0 + sigma_mM_sqrd * (f - mu_m) / (sigma_m**2 + 1e-9) # should be size: batch size x 1
+                    # cdf and pdf terms
+                    cdf_term = standard_normal.cdf((f_max_samples - u_x) / (torch.sqrt(s_sqrd) + 1e-9)) # should be size: batch size x samples
+                    pdf_term = torch.exp(standard_normal.log_prob((f - mu_m) / (sigma_m + 1e-9)))
+                    return cdf_term * pdf_term
+                # and define Z, add 1e-10 for numerical stability
+                inv_Z = standard_normal.cdf((f_max_samples - mu_0) / (sigma_0 + 1e-9)) * sigma_m + 1e-10
+                Z =  1 / inv_Z
+                # we can now estimate the one dimensional integral
+                # define integral range
+                f_range = torch.linspace(self.min_integration, self.max_integration, steps = self.num_of_integration_steps)
+                # preallocate the space 
+                integral_grid = torch.zeros(size = (self.num_of_integration_steps, batch_size, num_max_samples))
+                # calculate corresponding y values
+                for idx, f in enumerate(f_range):
+                    z_psi = Z * Psi(f)
+                    # recall that limit of x * log(x) as x-> 0 is 0; but computationally we get nans, so set it to 1 to obtain correct values
+                    z_psi = z_psi.masked_fill(z_psi <= 0, 1)
+                    y_vals = z_psi * torch.log(z_psi)
+                    if y_vals.isnan().any():
+                        print('stap')
+                    integral_grid[idx, :, :] = y_vals
+                # estimate integral using trapezium rule
+                integral_estimates = torch.trapezoid(integral_grid, f_range, dim = 0)
+                # now estimate H2 using Monte Carlo
+                H_2 = - integral_estimates.mean(axis = 1).reshape(-1, 1)
+            
+            # finally calculate information gain by summing entropies
+            H = H_1 - H_2
+            if H.isnan().any():
+                print('stop')
+            if (H == torch.inf).any():
+                print('AAAAAAA')
+            return H
+        # otherwise do parallel optimization by considering queries being evaluated
+        else:
+            # define fidelity vectors
+            target_fidelity_vector = torch.zeros(size = (batch_size,))
+            joint_fidelity_vector = torch.concat((fidelity_vector, target_fidelity_vector))
+            # now calculate matrices
+            with gpytorch.settings.fast_pred_var():
+                    # mean covariance matrix of vectors being evaluated
+                    self.model.model.eval()
+                    dist_f_q = self.model.model(current_batch, current_batch_fids)
+                    covar_matrix_q = dist_f_q.lazy_covariance_matrix
+                    if torch.linalg.det(covar_matrix_q.tensor) == 0:
+                        # if matrix is singular, add jitter
+                        covar_matrix_q = covar_matrix_q + torch.diag(standard_normal.sample(torch.Size([3])) * 1e-10)
+                    covar_matrix_q_inv = gpytorch.lazify(torch.inverse(covar_matrix_q.tensor))
+                    mu_q = dist_f_q.mean.reshape(-1, 1) # q by 1
+                    # further, create samples from f_q
+                    f_q_samples = dist_f_q.sample(sample_shape=torch.Size([self.num_of_fantasies])) # size self.num_of_fantasies x q
+                    # Sigma_M, covariance of current fidelity and target fidelity
+                    out_Sigma_M = self.model.model(X.repeat(2, 1), joint_fidelity_vector)
+                    covar_matrix_M = out_Sigma_M.lazy_covariance_matrix
+                    mean_sigma_M = out_Sigma_M.mean
+                    mu_m = mean_sigma_M[:batch_size]
+                    mu_0 = mean_sigma_M[batch_size:]
+                    # Sigma_MQ, covariance of current fidelity, target fidelity and points being evaluated
+                    out_Sigma_MQ = self.model.model(torch.cat((X.repeat(2, 1), current_batch)), torch.cat((joint_fidelity_vector, current_batch_fids.reshape(-1))))
+                    covar_matrix_MQ = out_Sigma_MQ.lazy_covariance_matrix[:2*batch_size, 2*batch_size:]
+            # calculate matrix product
+            covariance_matrix_given_q = covar_matrix_M - covar_matrix_MQ.matmul(covar_matrix_q_inv).matmul(covar_matrix_MQ.t())
+            # now obtain variances we need for calculations, avoid negative variances fue to numerical issues by taking maximum for small numbers
+            sigma_mM_sqrd_given_q = torch.maximum(covariance_matrix_given_q[:batch_size, batch_size:].diag().reshape(-1, 1), torch.tensor(self.num_stability))
+            sigma_m_sqrd_given_q = torch.maximum(covariance_matrix_given_q[:batch_size, :batch_size].diag().reshape(-1, 1), torch.tensor(self.num_stability))
+            sigma_M_sqrd_given_q = torch.maximum(covariance_matrix_given_q[batch_size:, batch_size:].diag().reshape(-1, 1), torch.tensor(self.num_stability))
+            if (sigma_M_sqrd_given_q < 0).any():
+                print('sad')
+            # calculate f_star samples 
+            # first calculate mean: q x self.num_of_fantasies
+            fq_minus_mu_q = f_q_samples.T - mu_q.repeat(1, self.num_of_fantasies)
+            # multiple by matrices to obtain final matrix of shape 2B x self.num_of_fantasies
+            mu_update = covar_matrix_MQ.matmul(covar_matrix_q_inv).matmul(fq_minus_mu_q)
+            mu_matrix = mean_sigma_M.reshape(-1, 1).repeat(1, self.num_of_fantasies) # now has shape 2B x self.num_of_fantasies
+            # finally obtain samples of mean of f given q
+            f_given_q_samples = mu_matrix + mu_update
+            # and with this, obtain f_star_samples
+            f_star_samples = f_max_samples - f_given_q_samples[batch_size:, :]
+            # define nu function
+            def nu(f):
+                # first the cdf in the numerator
+                numerator_cdf_inner_numerator = f_star_samples - sigma_mM_sqrd_given_q / (sigma_m_sqrd_given_q) * f
+                numerator_cdf_inner_denominator = sigma_M_sqrd_given_q - sigma_mM_sqrd_given_q**2 / (sigma_m_sqrd_given_q) + self.num_stability
+                numerator_cdf_inner = numerator_cdf_inner_numerator / numerator_cdf_inner_denominator
+                numerator_cdf = standard_normal.cdf(numerator_cdf_inner)
+
+                # now the pdf in the numerator
+                numerator_pdf_inner = f / (sigma_m_sqrd_given_q.sqrt())
+                numerator_pdf = torch.exp(standard_normal.log_prob(numerator_pdf_inner))
+
+                # define full numerator now
+                numerator = numerator_cdf * numerator_pdf
+
+                # denominator cdf
+                denominator_cdf_inner = f_star_samples / (sigma_M_sqrd_given_q.sqrt())
+                denominator_cdf = standard_normal.cdf(denominator_cdf_inner)
+
+                # define full denominator now
+                denominator = denominator_cdf * sigma_m_sqrd_given_q.sqrt() + self.num_stability
+
+                if (denominator == 0).any() or denominator.isnan().any() or denominator.isinf().any():
+                    print('yaaaa')
+                
+                if numerator.isnan().any() or numerator.isinf().any():
+                    print('yaaaa')
+
+                if (numerator / denominator > 1e10).any():
+                    a = 0
+
+                return numerator / (denominator)
+            
+            # define integration range
+            f_limit_range = [10**int(i) for i in range(-6, 2)]
+            with torch.no_grad():
+                for f in f_limit_range:
+                    latest_f = f
+                    max_nu_val = torch.max(nu(f))
+                    if max_nu_val < 1e-30:
+                        break
+            # define integral range
+            left_linspace = torch.linspace(-latest_f, 0, steps = self.num_of_integration_steps)
+            right_linspace = torch.linspace(0, latest_f, steps = self.num_of_integration_steps)
+            f_range = torch.concat((left_linspace, right_linspace[1:]))
+            # preallocate the space 
+            integral_grid = torch.zeros(size = (self.num_of_integration_steps * 2 - 1, batch_size, self.num_of_fantasies))
+            # calculate corresponding y values
+            for idx, f in enumerate(f_range):
+                nu_preprocessed = nu(f)
+                # recall that limit of x * log(x) as x-> 0 is 0; but computationally we get nans, so set it to 1 to obtain correct values
+                nu_processed = nu_preprocessed.masked_fill(nu_preprocessed <= 0, self.num_stability)
+                y_vals = nu_processed * torch.log(nu_processed)
+                if y_vals.isnan().any():
+                    print('stap')
+                integral_grid[idx, :, :] = y_vals
+            # estimate integral using trapezium rule
+            integral_estimates = torch.trapezoid(integral_grid, f_range, dim = 0)
+            # now estimate H2 using Monte Carlo
+            H_2 = - integral_estimates.mean(axis = 1).reshape(-1, 1)
+
+            # calculate H_1 which is analytical
+            H_1_inner = sigma_m_sqrd_given_q.sqrt() * torch.sqrt(2 * torch.pi * torch.exp(torch.tensor(1)))
+            H_1_inner = H_1_inner.masked_fill(H_1_inner <= 0, self.num_stability)
+            H_1 = torch.log(H_1_inner)
+
+            # finally calculate information gain by summing entropies
+            H = H_1 - H_2
+            if H.isnan().any():
+                print('stop')
+            if (H == torch.inf).any():
+                print('AAAAAAA')
+            return H
+            
+    def optimise_af(self):
+        '''
+        This function optimizes the acquisition function, and returns the next query point
+        '''
+        # if time is zero, pick point at random, lowest fidelity
+        if self.current_time == 0:
+            new_X = np.random.uniform(size = self.dim).reshape(1, -1)
+            new_M = np.array(self.num_of_fidelities - 1).reshape(1, 1)
+            return new_X, new_M
+        
+        # if we are going to optimize, generate samples
+        self.generate_max_samples()
+        
+        # if we are simply optimizing with grid search, to be used when there are constraints
+        if self.grid_search is True:
+            best_outputs = []
+            best_inputs = []
+            for fidelity in range(self.num_of_fidelities):
+                with torch.no_grad():
+                    # generate search grid
+                    if self.grid_to_search == None:
+                        self.grid_to_search = self.env.func.gen_search_grid(50 * self.num_of_starts / self.num_of_fidelities)
+                    X = self.grid_to_search.clone()
+                    # check acquisition function in grid
+                    af = self.build_af(X, int(fidelity))
+                    # choose the best point
+                    best_idx = torch.argmax(af)
+                    # choose best outputs as well
+                    best_output = torch.max(af)
+                # return the best value in the grid
+                best_input = X[best_idx, :].detach()
+                best = best_input.detach().numpy().reshape(1, -1)
+                new_X = best.reshape(1, -1)
+                # best output divided by cost
+                best_outputs.append(best_output / self.env.func.expected_costs[fidelity])
+                best_inputs.append(new_X)
+            
+            new_M = np.argmax(best_output)
+            new_X = best_inputs[new_M]
+            new_M = np.array(new_M).reshape(-1, 1)
+
+            return new_X, new_M
+
+        best_outputs = []
+        best_inputs = []
+        for fidelity in range(self.num_of_fidelities):
+            # optimisation bounds
+            bounds = torch.stack([torch.zeros(self.dim), torch.ones(self.dim)])
+            # sobol initialization initialization, on 100 * num_of_starts, check for best 10 and optimize from there
+            sobol_gen = torch.quasirandom.SobolEngine(self.dim, scramble = True)
+            X = sobol_gen.draw(50 * self.num_of_starts).double()
+
+            with torch.no_grad():
+                af = self.build_af(X, int(fidelity))
+                idx_list = list(range(0, self.num_of_starts * 50))
+                sorted_af_idx = [idx for _, idx in sorted(zip(af, idx_list))]
+                best_idx = sorted_af_idx[-10:]
+
+            # choose best starts for X
+            X = X[best_idx, :]
+            if X.isnan().any():
+                print('why why why why')
+            X.requires_grad = True
+            # define optimiser
+            optimiser = torch.optim.Adam([X], lr = 0.01)
+            af = self.build_af(X, fidelity = fidelity)
+            if af.isnan().any():
+                print('why')
+            
+            # do the optimisation
+            for _ in range(self.num_of_optim_epochs):
+                if X.isnan().any():
+                    print('why why why why')
+                # set zero grad
+                optimiser.zero_grad()
+                # losses for optimiser
+                losses = -self.build_af(X, fidelity = fidelity)
+                if losses.isnan().any():
+                    print('why')
+                loss = losses.sum()
+                loss.backward()
+                # optim step
+                optimiser.step()
+                if X.isnan().any():
+                    print('why why why why')
+
+                # make sure we are still within the bounds
+                for j, (lb, ub) in enumerate(zip(*bounds)):
+                    X.data[..., j].clamp_(lb, ub)
+                
+                if X.isnan().any():
+                    print('why why why why')
+            
+            # find the best start
+            best_start = torch.argmax(-losses)
+
+            # corresponding best input
+            best_input = X[best_start, :].detach()
+            best = best_input.detach().numpy().reshape(1, -1)
+            new_X = best.reshape(1, -1)
+            best_inputs.append(new_X)
+            best_outputs.append(torch.max(-losses).detach().numpy() / self.env.func.expected_costs[fidelity])
+
+        new_M = np.argmax(best_outputs)
+        new_X = best_inputs[new_M]
+        new_M = np.array(new_M).reshape(-1, 1)
+
+        return new_X, new_M
+    
+    def generate_max_samples(self, fidelity = 0):
+        sobol_gen = torch.quasirandom.SobolEngine(self.dim, scramble = True)
+        X_test_samples = sobol_gen.draw(100 * self.num_of_starts).double()
+        samples = self.model.generate_samples(X_test_samples, fidelity = fidelity, num_of_samples = self.num_of_fantasies)
+        self.f_max_samples, _ = torch.max(samples, dim = 1)
