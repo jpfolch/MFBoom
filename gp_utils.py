@@ -11,6 +11,7 @@ from torch.optim import Adam
 from typing import Any
 from torch import Tensor
 from gpytorch.distributions import MultivariateNormal, base_distributions
+import matplotlib.pyplot as plt
 
 '''
 This python file defines the Gaussian Process class which is used in all optimization methods.
@@ -258,7 +259,7 @@ class MultiTaskBoTorchGP():
         else:
             self.noise_constraint = False
 
-    def optim_hyperparams(self, num_of_epochs = 25, verbose = False, train_only_outputscale_and_noise = False):
+    def optim_hyperparams(self, num_of_epochs = 75, verbose = False, train_only_outputscale_and_noise = False):
         '''
         We can optimize the hype-parameters by maximizing the marginal log-likelihood.
         '''
@@ -354,6 +355,13 @@ class MultiTaskBoTorchGP():
         
         return mean, std
 
+    def generate_samples(self, X, fidelity = 0, num_of_samples = 1):
+        posterior_points = X.shape[0]
+        i = torch.full(size = (posterior_points,), fill_value = fidelity).reshape(-1, 1)
+        self.model.eval()
+        posterior_distribution = self.model(X, i)
+        samples = posterior_distribution.sample(torch.Size((num_of_samples,)))
+        return samples
 
 # For MultiTask we need to define a new model within GPyTorch, that implements the intrinsic model of coregionalization (IMC)
 
@@ -378,7 +386,6 @@ class MultitaskGPModel(gpytorch.models.ExactGP):
             exec(f'self.task_covar_module_{task_num} =  gpytorch.kernels.IndexKernel(num_tasks = num_tasks, rank = rank[task_num])')
 
     def forward(self, x, i):
-        # THIS LIST STRUCTURE MIGHT BE KILLING LENGTH-SCALE LEARNING
         mean_x = self.mean_module(x)
         # Get input-input covariance
         covar_x = self.covar_module_0(x)
@@ -396,6 +403,24 @@ class MultitaskGPModel(gpytorch.models.ExactGP):
             covar = covar + covar_x.mul(covar_i)
         
         return gpytorch.distributions.MultivariateNormal(mean_x, covar)
+    
+    def covariance_matrix(self, x, i):
+        # Get input-input covariance
+        covar_x = self.covar_module_0(x)
+        # Get task-task covariance
+        covar_i = self.task_covar_module_0(i)
+        # Multiply the two together to get the covariance we want
+        covar = covar_x.mul(covar_i)
+        
+        for latent in range(1, self.num_of_latents):
+            # Get input-input covariance
+            exec(f'covar_x = self.covar_module_{latent}(x)')
+            # Get task-task covariance
+            exec(f'covar_i = self.task_covar_module_{latent}(i)')
+            # add the new covariance
+            covar = covar + covar_x.mul(covar_i)
+        
+        return covar
 
 class MultitaskGPModelICM(gpytorch.models.ExactGP):
     def __init__(self, train_x, train_y, likelihood, num_tasks = 2, rank = 2):
@@ -476,7 +501,12 @@ class MultitaskGaussianLikelihood(_GaussianLikelihoodBase):
             task_idx_diag = (self.active_i == task_num).int().reshape(-1).diag()
             mask[..., task_num, :, :] = task_idx_diag
         # multiply covar by masking
-        noise_covar_matrix = noise_base_covar_matrix.mul(mask).sum(dim = 1)
+        # there seems to be problems when base_shape is singleton, so we need to squeeze
+        if base_shape == torch.Size([1]):
+            noise_base_covar_matrix = noise_base_covar_matrix.squeeze(-1).mul(mask.squeeze(-1))
+            noise_covar_matrix = noise_base_covar_matrix.unsqueeze(-1).sum(dim = 1)
+        else:
+            noise_covar_matrix = noise_base_covar_matrix.mul(mask).sum(dim = 1)
         return noise_covar_matrix
     
     def forward(self, function_samples: Tensor, test_i = None, *params: Any, **kwargs: Any) -> base_distributions.Normal:
