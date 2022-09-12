@@ -334,6 +334,51 @@ class Borehole8D():
                 times.append(1)
         return np.array(times).reshape(-1, 1)
 
+class Ackley40D():
+    def __init__(self):
+        self.dim = 40
+        self.optimum = 0
+        self.num_of_fidelities = 2
+        self.name = 'Ackley40D'
+        self.require_transform = True
+        self.fidelity_costs = [1, 1]
+        self.expected_costs = [10, 1]
+
+        self.a = 20
+        self.b = 0.2
+        self.c = 2 * np.pi
+
+    def draw_new_function(self):
+        pass
+    
+    def query_function_torch(self, x):
+        x = x * 9 - 4
+        s1 = torch.sum(x**2, axis = 1) / self.dim
+        s2 = torch.sum(torch.cos(self.c * x), axis = 1) / self.dim
+        return (self.a * torch.exp(-self.b * torch.sqrt(s1)) + torch.exp(s2) - self.a - torch.exp(torch.tensor(1))) / 6
+
+    def evaluate(self, x, m):
+        if m == 0:
+            x = x * 9 - 4
+            s1 = np.sum(x**2, axis = 1) / self.dim
+            s2 = np.sum(np.cos(self.c * x), axis = 1) / self.dim
+            return (self.a * np.exp(-self.b * np.sqrt(s1)) + np.exp(s2) - self.a - np.exp(1)) / 6
+        elif m == 1:
+            x = x * 9 - 3.8
+            s1 = np.sum(x**2, axis = 1) / (self.dim + 5)
+            s2 = np.sum(np.cos(self.c * x), axis = 1) / (self.dim + 3)
+            return (self.a * np.exp(-self.b * np.sqrt(s1)) + np.exp(s2) - self.a - np.exp(1)) / 6
+
+    def eval_times(self, M):
+        # returns evaluation times for each query
+        times = []
+        for m in M:
+            if m == 0:
+                times.append(10)
+            else:
+                times.append(1)
+        return np.array(times).reshape(-1, 1)
+
 class MagicGammaSVM():
     def __init__(self):
         self.dim = 2
@@ -620,6 +665,7 @@ class DetergentOpti():
         with torch.no_grad():
             sobol_gen = torch.quasirandom.SobolEngine(self.dim, scramble = True)
             X = sobol_gen.draw(grid_size).double()
+            X = X + torch.rand_like(X) / 2000 # add random jitter to the sequence
             # check for validity of points
             constraint_idx = self.check_constraints(X)
             # make sure we have at least one valid point
@@ -787,7 +833,7 @@ def find_optimum(func, n_starts = 25, n_epochs = 100):
 
 # this last part is used to find the optimum of functions using gradient methods, if optimum is not available online
 if __name__ == '__main__':
-    func = CurrinExp2D()
+    func = Ackley40D()
     best_input, best_eval = find_optimum(func, n_starts = 100000, n_epochs = 1000)
     print(best_input)
     print(float(best_eval.detach()))
