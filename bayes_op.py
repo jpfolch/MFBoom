@@ -84,7 +84,7 @@ class mfLiveBatch():
         # optimisation parameters
         self.num_of_starts = num_of_starts
         self.num_of_optim_epochs = num_of_optim_epochs
-        self.grid_search = False
+        self.grid_search = self.env.func.grid_search
         self.grid_to_search = None
         # hp hyperparameters update frequency
         self.hp_update_frequency = hp_update_frequency
@@ -466,7 +466,7 @@ class mfLiveBatch():
         if self.grid_search is True:
             with torch.no_grad():
                 # regenerate search grid every time
-                self.grid_to_search = self.env.func.gen_search_grid(2500 * self.num_of_starts)
+                self.grid_to_search = self.env.func.gen_search_grid(int(100 * self.num_of_starts))
                 X = self.grid_to_search.clone()
                 # check acquisition function in grid
                 af = self.build_af(X)
@@ -764,8 +764,8 @@ class mfUCB(mfLiveBatch):
         # if we are simply optimizing with grid search, to be used when there are constraints
         if self.grid_search is True:
             with torch.no_grad():
-                if self.grid_to_search == None:
-                    self.grid_to_search = self.env.func.gen_search_grid(2500 * self.num_of_starts * self.dim)
+                # regenerate search grid every time
+                self.grid_to_search = self.env.func.gen_search_grid(int(100 * self.num_of_starts))
                 X = self.grid_to_search.clone()
                 # check acquisition function in grid
                 af = self.build_af(X)
@@ -1111,7 +1111,7 @@ class MultiTaskUCBwILP():
         # acquisition function optimization parameters
         self.num_of_starts = num_of_starts
         self.num_of_optim_epochs = num_of_optim_epochs
-        self.grid_search = False
+        self.grid_search = self.env.func.grid_search
         self.grid_to_search = None
         # hp hyperparameters update frequency
         self.hp_update_frequency = hp_update_frequency
