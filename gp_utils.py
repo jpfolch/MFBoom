@@ -9,7 +9,7 @@ from gpytorch.likelihoods import Likelihood, _GaussianLikelihoodBase
 from gpytorch.likelihoods.noise_models import MultitaskHomoskedasticNoise, HomoskedasticNoise
 from torch.optim import Adam
 from typing import Any
-from torch import Tensor
+from torch import Tensor, dtype
 from gpytorch.distributions import MultivariateNormal, base_distributions
 import matplotlib.pyplot as plt
 
@@ -27,8 +27,9 @@ class BoTorchGP():
             self.kernel = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel(ard_num_dims = lengthscale_dim))
         else:
             self.kernel = kernel
-        # initialize if we should set contrainst and if we have a multi-dimensional lengthscale
+        # initialize if we should set constraints and if we have a multi-dimensional lengthscale
         self.constraints_set = False
+        self.noise_constraint = False
         self.lengthscale_dim = lengthscale_dim
         self.model = None
         
@@ -81,6 +82,14 @@ class BoTorchGP():
             self.noise_constraint = True
         else:
             self.noise_constraint = False
+    
+    def define_noise_constraints(self, noise_lb = 1e-5, noise_ub = 0.2):
+        '''
+        This model defines constraints on hyper-parameters as defined in the Appendix of the paper.
+        '''
+        self.noise_ub = noise_ub
+        self.noise_lb = noise_lb
+        self.noise_constraint = True
 
     def optim_hyperparams(self, num_of_epochs = 25, verbose = False, train_only_outputscale_and_noise = False):
         '''
@@ -98,7 +107,13 @@ class BoTorchGP():
         prior_constant = SmoothedBoxPrior(-1, 1, 0.1)
         self.model.mean_module.register_prior('Smoothed Box Prior', prior_constant, "constant")
         # for noise constraint
-        prior_noise = SmoothedBoxPrior(1e-5, 0.2, 0.1)
+        # for noise constraint
+        if self.noise_constraint == True:
+            noise_lb = torch.tensor(self.noise_lb)
+            noise_ub = torch.tensor(self.noise_ub)
+            prior_noise = SmoothedBoxPrior(noise_lb, noise_ub, 0.1)
+        else:
+            prior_noise = SmoothedBoxPrior(1e-5, 0.2, 0.1)
         self.model.likelihood.register_prior('Smoothed Box Prior', prior_noise, "noise")
 
         if train_only_outputscale_and_noise:
@@ -193,13 +208,18 @@ class MultiTaskBoTorchGP():
         self.num_of_tasks = num_of_tasks
         self.num_of_latents = num_of_latents
         self.latent_ranks = ranks
+        # initialize noise constraint
+        self.noise_constraint = False
         
     def fit_model(self, train_x, train_y, train_hyperparams = False, previous_hyperparams = None):
         '''
         This function fits the GP model with the given data.
         '''
         # find dimension
-        dim = len(train_x[-1][0])
+        if train_x[-1] == []:
+            dim = len(train_x[0][0])
+        else:
+            dim = len(train_x[-1][0])
         # train_x is a list of lists, need to transform it into large vector form
         num_task_0_obs = len(train_x[0])
         
@@ -219,15 +239,17 @@ class MultiTaskBoTorchGP():
             train_y_task = np.array((train_y[task_num])).reshape(num_task_obs, 1)
             train_y_init = np.concatenate((train_y_init, train_y_task), axis = 0)
         # transform data to tensors
-        self.train_x = torch.tensor(train_x_init)
-        self.train_i = torch.tensor(train_i_init)
+        self.train_x = torch.tensor(train_x_init).double()
+        self.train_i = torch.tensor(train_i_init).int()
         train_y_init = np.array(train_y_init)
-        self.train_y = torch.tensor(train_y_init).reshape(-1)
+        self.train_y = torch.tensor(train_y_init).reshape(-1).double()
         # define model
         self.likelihood = MultitaskGaussianLikelihood(num_of_tasks = self.num_of_tasks, train_i = self.train_i)
         self.model = MultitaskGPModel(train_x = (self.train_x, self.train_i), train_y = self.train_y, likelihood = self.likelihood, num_tasks = self.num_of_tasks, rank = self.latent_ranks, num_of_latents = self.num_of_latents, lengthscale_dim = self.lengthscale_dim)
         # marginal likelihood
         self.mll = ExactMarginalLogLikelihood(likelihood = self.model.likelihood, model = self.model)
+        # change model dtype
+        self.model.double()
 
         # check if we should set hyper-parameters or if we should optimize them
         if previous_hyperparams is not None:
@@ -259,6 +281,14 @@ class MultiTaskBoTorchGP():
         else:
             self.noise_constraint = False
 
+    def define_noise_constraints(self, noise_lb = 1e-5, noise_ub = 0.2):
+        '''
+        This model defines constraints on hyper-parameters as defined in the Appendix of the paper.
+        '''
+        self.noise_ub = noise_ub
+        self.noise_lb = noise_lb
+        self.noise_constraint = True
+
     def optim_hyperparams(self, num_of_epochs = 75, verbose = False, train_only_outputscale_and_noise = False):
         '''
         We can optimize the hype-parameters by maximizing the marginal log-likelihood.
@@ -279,9 +309,14 @@ class MultiTaskBoTorchGP():
         prior_constant = SmoothedBoxPrior(-1, 1, 0.1)
         self.model.mean_module.register_prior('Smoothed Box Prior', prior_constant, "constant")
         # for noise constraint
-        noise_lb = torch.tensor([1e-5 for _ in range(self.num_of_tasks)])
-        noise_ub = torch.tensor([0.2 for _ in range(self.num_of_tasks)])
-        prior_noise = SmoothedBoxPrior(noise_lb, noise_ub, 0.1)
+        if self.noise_constraint == True:
+            noise_lb = torch.tensor([self.noise_lb for _ in range(self.num_of_tasks)])
+            noise_ub = torch.tensor([self.noise_ub for _ in range(self.num_of_tasks)])
+            prior_noise = SmoothedBoxPrior(noise_lb, noise_ub, 0.1)
+        else:
+            noise_lb = torch.tensor([1e-5 for _ in range(self.num_of_tasks)])
+            noise_ub = torch.tensor([0.2 for _ in range(self.num_of_tasks)])
+            prior_noise = SmoothedBoxPrior(noise_lb, noise_ub, 0.1)
         self.model.likelihood.register_prior('Smoothed Box Prior', prior_noise, "noise")
         
         # define optimiser
@@ -357,7 +392,7 @@ class MultiTaskBoTorchGP():
 
     def generate_samples(self, X, fidelity = 0, num_of_samples = 1):
         posterior_points = X.shape[0]
-        i = torch.full(size = (posterior_points,), fill_value = fidelity).reshape(-1, 1)
+        i = torch.full(size = (posterior_points,), fill_value = fidelity).reshape(-1, 1).int()
         self.model.eval()
         posterior_distribution = self.model(X, i)
         samples = posterior_distribution.sample(torch.Size((num_of_samples,)))
