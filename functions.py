@@ -22,6 +22,7 @@ class CurrinExp2D():
         self.require_transform = False
         self.fidelity_costs = [1, 1]
         self.expected_costs = [10, 1]
+        self.grid_search = False
     
     def draw_new_function(self):
         pass
@@ -76,6 +77,7 @@ class BadCurrinExp2D():
         self.require_transform = False
         self.fidelity_costs = [1, 1]
         self.expected_costs = [10, 1]
+        self.grid_search = False
     
     def draw_new_function(self):
         pass
@@ -126,6 +128,7 @@ class Park4D():
         self.require_transform = False
         self.fidelity_costs = [1, 1]
         self.expected_costs = [10, 1]
+        self.grid_search = False
     
     def draw_new_function(self):
         pass
@@ -180,6 +183,7 @@ class Hartmann3D():
         self.require_transform = False
         self.fidelity_costs = [1, 1, 1]
         self.expected_costs = [100, 10, 1]
+        self.grid_search = False
 
         self.A = np.array([[3, 10, 30], [0.1, 10, 35], [3, 10, 30], [0.1, 10, 35]])
         self.P = (1e-4) * np.array([[3689, 1170, 2673], [4699, 4387, 7470], [1091, 8732, 5547], [381, 5743, 8828]])
@@ -231,6 +235,7 @@ class Hartmann6D():
         self.require_transform = False
         self.fidelity_costs = [1, 1, 1]
         self.expected_costs = [100, 10, 1]
+        self.grid_search = False
 
         self.A = np.array([[10, 3, 17, 3.5, 1.7, 8], [0.05, 10, 17, 0.1, 8, 14], [3, 3.5, 1.7, 10, 17, 8], [17, 8, 0.05, 10, 0.1, 14]])
         self.P = (1e-4) * np.array([[1312, 1696, 5569, 124, 8283, 5886], [2329, 4135, 8307, 3736, 1004, 9991], [2348, 1451, 3522, 2883, 3047, 6650], [4047, 8828, 8732, 5743, 1091, 381]])
@@ -282,6 +287,7 @@ class Borehole8D():
         self.require_transform = False
         self.fidelity_costs = [1, 1]
         self.expected_costs = [10, 1]
+        self.grid_search = False
 
     def draw_new_function(self):
         pass
@@ -343,6 +349,7 @@ class Ackley40D():
         self.require_transform = True
         self.fidelity_costs = [1, 1]
         self.expected_costs = [10, 1]
+        self.grid_search = False
 
         self.a = 20
         self.b = 0.2
@@ -389,6 +396,7 @@ class MagicGammaSVM():
         self.fidelity_costs = [1, 1]
         self.expected_costs = [16, 1]
         self.initalize_training_sets()
+        self.grid_search = False
     
     def initalize_training_sets(self):
         # select data
@@ -459,6 +467,7 @@ class RandomForestFMNIST():
         self.fidelity_costs = [1, 1]
         self.expected_costs = [3, 1]
         self.initalize_training_sets()
+        self.grid_search = False
     
     def initalize_training_sets(self):
         # select data
@@ -532,6 +541,7 @@ class CNNFashionMNIST():
         self.fidelity_costs = [1, 1]
         self.expected_costs = [20, 1]
         self.initalize_training_sets()
+        self.grid_search = False
     
     def initalize_training_sets(self):
         # select data
@@ -599,13 +609,14 @@ class DetergentOpti():
         assert obj in [1, 2, 3, 4, 5], 'Objective not in [1, 2, 3, 4, 5]'
 
         self.dim = 5
-        self.optimum = 2.2
+        self.optimum = 2.375115521
         self.num_of_fidelities = 3
         self.name = 'Detergent'
         self.require_transform = False
         self.fidelity_costs = [5, 2, 1]
         self.expected_costs = [10, 3, 1]
         self.obj_number = obj - 1
+        self.grid_search = True
     
     def check_constraints(self, x):
         # change to correct function bounds
@@ -674,7 +685,7 @@ class DetergentOpti():
         return X
 
 class Battery():
-    def __init__(self, obj = 1):
+    def __init__(self, obj = 2):
         assert obj in [1, 2, 3, 4, 5, 6, 7], 'Objective not in [1, 2, 3, 4, 5]'
 
         self.dim = 5
@@ -685,10 +696,11 @@ class Battery():
         self.fidelity_costs = [1, 1]
         self.expected_costs = [10, 1]
         self.obj_number = obj - 1
+        self.grid_search = True
 
         # polynomial transformer
         self.poly_transformer = PolynomialFeatures()
-        self.poly_transformer_low_fid = PolynomialFeatures(interaction_only = False)
+        self.poly_transformer_low_fid = PolynomialFeatures(interaction_only = True)
         # coefficients from estimation before
         self.coeff = np.array([[ 0.        , -2.95348376, -2.8920144 , -2.70870077, -2.67345303,
         -2.60693042,  2.05745867,  4.02777526,  3.81108158,  3.75152145,
@@ -763,14 +775,15 @@ class Battery():
             # outputs battery data
             battery_output = np.matmul(x_poly, self.coeff.T)
             # choose corresponding objective
-            battery_output = battery_output[self.obj_number, :]
+            battery_output = battery_output[:, self.obj_number]
         elif m == 1:
             # transform x in low fidelity
             x_poly = self.poly_transformer_low_fid.fit_transform(x)
             # outputs battery data
             battery_output = np.matmul(x_poly, self.coeff_low_fid.T)
             # battery_output with bias and noise
-            battery_output = max(battery_output - 0.1 + np.random.normal(scale = 0.1 / 3, size = battery_output.shape), 0)
+            battery_output = np.maximum(battery_output - 0.1 + np.random.normal(scale = 0.1 / 3, size = battery_output.shape), 0)
+            battery_output = battery_output[:, self.obj_number]
         
         return battery_output
     
@@ -787,14 +800,14 @@ class Battery():
     def gen_search_grid(self, grid_size):
         with torch.no_grad():
             # all idxs due to n choose k constraint
-            all_idxs = [list(c) for c in combinations([0, 1, 2, 3, 4, 5], 3)]
+            all_idxs = [list(c) for c in combinations([0, 1, 2, 3, 4], 3)]
             # generate a single sobol sequence
             sobol_gen = torch.quasirandom.SobolEngine(3, scramble = True)
             X_sobol_3d = sobol_gen.draw(grid_size).double()
             # put sequence through soft-max
             X_sobol_3d = torch.softmax(X_sobol_3d * 5, dim = 1)
-            # define large zero vector
-            X_out = torch.zeros(size = (grid_size * 20)).double()
+            # define large zero vector, multiply by 20 because of number of combinations
+            X_out = torch.zeros(size = (grid_size * 10, 5)).double()
             # add sobol sequence to larger grid
             for i, idx_comb in enumerate(all_idxs):
                 X_out[i * grid_size: (i+1) * grid_size, idx_comb] = X_sobol_3d.clone()
