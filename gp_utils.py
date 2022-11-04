@@ -107,7 +107,6 @@ class BoTorchGP():
         prior_constant = SmoothedBoxPrior(-1, 1, 0.1)
         self.model.mean_module.register_prior('Smoothed Box Prior', prior_constant, "constant")
         # for noise constraint
-        # for noise constraint
         if self.noise_constraint == True:
             noise_lb = torch.tensor(self.noise_lb)
             noise_ub = torch.tensor(self.noise_ub)
@@ -480,25 +479,13 @@ class MultitaskGPModelICM(gpytorch.models.ExactGP):
 
 class MultitaskGaussianLikelihood(_GaussianLikelihoodBase):
     r"""
-    The standard likelihood for regression.
-    Assumes a standard homoskedastic noise model:
+    Likelihood for input-wise homo-skedastic noise, and task-wise hetero-skedastic, i.e. we learn a different (constant) noise level for each fidelity.
 
-    .. math::
-        p(y \mid f) = f + \epsilon, \quad \epsilon \sim \mathcal N (0, \sigma^2)
-
-    where :math:`\sigma^2` is a noise parameter.
-
-    .. note::
-        This likelihood can be used for exact or approximate inference.
-
-    :param noise_prior: Prior for noise parameter :math:`\sigma^2`.
-    :type noise_prior: ~gpytorch.priors.Prior, optional
-    :param noise_constraint: Constraint for noise parameter :math:`\sigma^2`.
-    :type noise_constraint: ~gpytorch.constraints.Interval, optional
-    :param batch_shape: The batch shape of the learned noise parameter (default: []).
-    :type batch_shape: torch.Size, optional
-
-    :var torch.Tensor noise: :math:`\sigma^2` parameter (noise)
+    To initialize:
+    num_of_tasks : int
+    train_i : vector of tasks indexes for each training data-point
+    noise_prior : any prior you want to put on the noise
+    noise_constraint : constraint to put on the noise
     """
 
     def __init__(self, num_of_tasks, train_i, noise_prior=None, noise_constraint=None, batch_shape=torch.Size(), **kwargs):
@@ -557,70 +544,3 @@ class MultitaskGaussianLikelihood(_GaussianLikelihoodBase):
         noise_covar = self._shaped_noise_covar(mean.shape, *params, **kwargs).squeeze(0)
         full_covar = covar + noise_covar
         return function_dist.__class__(mean, full_covar)
-
-if __name__ == '__main__':
-
-    import matplotlib.pyplot as plt
-
-    func1 = lambda x: np.sin(10 * x)
-    func2 = lambda x: 0.7 * np.sin(10 * x) - 0.2 + np.random.normal(scale = 0.1, size = x.shape)
-
-    x_train_1 = np.random.uniform(low = 0, high = 0.5, size = (5, 1))
-    x_train_1_list = []
-    for i in range(x_train_1.shape[0]):
-        x_train_1_list.append(x_train_1[i, :])
-    x_train_2 = np.random.uniform(low = 0, high = 1.0, size = (20, 1))
-    x_train_2_list = []
-    for i in range(x_train_2.shape[0]):
-        x_train_2_list.append(x_train_2[i, :])
-
-    y_train_1 = func1(x_train_1)
-    y_train_1_list = []
-    for i in range(y_train_1.shape[0]):
-        y_train_1_list.append(y_train_1[i, :])
-    y_train_2 = func2(x_train_2)
-    y_train_2_list = []
-    for i in range(y_train_2.shape[0]):
-        y_train_2_list.append(y_train_2[i, :])
-    
-    X = [x_train_1_list, x_train_2_list]
-    Y = [y_train_1_list, y_train_2_list]
-
-    model = MultiTaskBoTorchGP(num_of_tasks = 2, num_of_latents = 2, ranks = [2, 2], lengthscale_dim = 1)
-    model.fit_model(X, Y)
-    model.optim_hyperparams(num_of_epochs = 250, verbose = True)
-    # create test set
-    test_x = torch.linspace(0, 1, 101).double().reshape(-1, 1)
-    test_i_task1 = torch.full((test_x.shape[0], 1), dtype=torch.long, fill_value=0)
-    test_i_task2 = torch.full((test_x.shape[0], 1), dtype=torch.long, fill_value=1)
-
-    y_mean_1, y_std_1 = model.posterior(test_x, test_i_task1, with_likelihood = True)
-    y_mean_2, y_std_2 = model.posterior(test_x, test_i_task2, with_likelihood = True)
-
-    # Initialize plots
-    f, (y1_ax, y2_ax) = plt.subplots(1, 2, figsize=(8, 3))
-    
-    # Define plotting function
-    def ax_plot(ax, train_y, train_x, y_mean, y_std, title, plot_num):
-        # Get lower and upper confidence bounds
-        lower = y_mean.detach().numpy() - 2 * y_std.detach().numpy()
-        upper = y_mean.detach().numpy() + 2 * y_std.detach().numpy()
-        # Plot training data as black stars
-        ax.plot(train_x, train_y, 'r*')
-        # Predictive mean as blue line
-        ax.plot(test_x.detach().numpy(), y_mean.detach().numpy(), 'b')
-        # Shade in confidence
-        ax.fill_between(test_x.detach().numpy().reshape(-1), lower.reshape(-1), upper.reshape(-1), alpha=0.5)
-        # Objective
-        if plot_num == 2:
-            ax.scatter(test_x.detach().numpy(), func2(test_x.detach().numpy()), marker = '.', color = 'k')
-        else:
-            ax.plot(test_x.detach().numpy(), func1(test_x.detach().numpy()), 'k--')
-        ax.set_ylim([-1.7, 1.7])
-        ax.legend(['Observed Data', 'Mean', 'Confidence', 'Objective'])
-        ax.set_title(title)
-
-    ax_plot(y1_ax, y_train_1, x_train_1, y_mean_1, y_std_1, 'Observed Values (Likelihood)', 1)
-    ax_plot(y2_ax, y_train_2, x_train_2, y_mean_2, y_std_2, 'Observed Values (Likelihood)', 2)
-
-    print('stap')
