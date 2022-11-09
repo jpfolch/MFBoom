@@ -140,9 +140,6 @@ submit.pbs
 # Figures
 Figures/
 
-# data
-data/
-
 # local stuff
 nn_utils.py
 bnn_utils.py
