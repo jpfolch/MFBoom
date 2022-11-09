@@ -133,10 +133,6 @@ dmypy.json
 
 # experiments
 experiment_results/
-experiment_results2/
-experiment_results3/
-experiment_results3_low_thresholds/
-experiment_results3_low_thresholds_before_lp_fix/
 
 # HPC submit
 submit.pbs 
@@ -146,3 +142,10 @@ Figures/
 
 # data
 data/
+
+# local stuff
+nn_utils.py
+bnn_utils.py
+bnn_utils/
+svm_test.py
+testing.py
