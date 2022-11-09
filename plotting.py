@@ -2,10 +2,9 @@ import numpy as np
 import matplotlib.pyplot as plt
 from functions import CurrinExp2D, BadCurrinExp2D, Hartmann3D, Park4D, Borehole8D, Hartmann6D, Ackley40D, Battery
 
-####
-# This script can be used to generate the plots in the paper, given the folder of results
-####
-
+'''
+This script can be used to generate the plots in the paper, given the folder of results, which can be generated using experiments.py
+'''
 
 function_list = [CurrinExp2D(), BadCurrinExp2D(), Hartmann3D(), Hartmann6D(), Park4D(), Borehole8D(), Ackley40D(), Battery()]
 function_list = [Battery()]
