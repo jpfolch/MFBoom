@@ -3,6 +3,14 @@ import matplotlib.pyplot as plt
 from gp_utils import BoTorchGP
 import torch
 
+"""
+Script used to create Illustrations in the paper.
+
+It provides illustration of Local Penalization [Alvi et al. 2019] and MF-GP-UCB [Kandasamy et al. 2016]
+
+"""
+
+
 plot_objective = False
 plot_ucb_low_fid = False
 plot_ucb_low_fid_plus_bias = False
