@@ -8,6 +8,29 @@ import time
 from dataclasses import dataclass
 import math
 
+"""
+Script where all the Bayesian Optimization benchmarks are stored.
+
+mfLiveBatch (original name of the paper) refers to the MF-GP-UCB with Local Penalization [Kandasamy et al. 2016, Gonzales et al. 2016
+Alvi et al. 2019]
+
+UCBwILP refers to PLAyBOOK [Alvi et al. 2019]
+
+mfUCB refers to MF-GP-UCB [Kandasamy et al. 2016]
+
+simpleUCB refers to the classical Upper Confidence Bound benchmark [Svrinivas et al. 2010]
+
+MultiTaskUCBwILP refers to our method, using Local Penalization for batching
+
+MF_MES refers to Multi-fidelity Max-Entropy Search [Takeno et al. 2020]
+
+MF_TuRBO refers to our method, when used in conjunction with [Eriksson et al. 2019]
+
+TuRBO refers to the classical method of [Eriksson et al. 2019]
+
+"""
+
+
 class mfLiveBatch():
     def __init__(self, env, beta = None, fidelity_thresholds = None, lipschitz_constant = 1, num_of_starts = 75, num_of_optim_epochs = 25, \
         hp_update_frequency = None, budget = 10, cost_budget = 4, initial_bias = 0.1, local_lipschitz = True, increasing_thresholds = False):
