@@ -9,7 +9,6 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import accuracy_score
 from sklearn.preprocessing import PolynomialFeatures
 from sklearn.linear_model import LinearRegression
-from nn_utils import CNN
 from opti.problems import Detergent
 from itertools import combinations
 import pickle
