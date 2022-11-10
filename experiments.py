@@ -52,9 +52,8 @@ assert method in ['mfLiveBatch', 'UCBwILP', 'mfUCB', 'simpleUCB', 'MultiTaskUCBw
 assert function_number in range(9), 'Function must be integer between 0 and 8'
 assert fidelity_choice in ['variance_thresholds', 'information_based', 'no_fid_choice']
 
-# Define function name
 battery_alpha = alpha
-# functions = [CurrinExp2D(), BadCurrinExp2D(), Hartmann3D(), Hartmann6D(), Park4D(), Borehole8D(), MagicGammaSVM(), CNNFashionMNIST(), DetergentOpti()]
+# Define function name
 functions = [CurrinExp2D(), BadCurrinExp2D(), Hartmann3D(), Hartmann6D(), Park4D(), Borehole8D(), Ackley40D(), Battery(alpha = battery_alpha)]
 func = functions[function_number]
 
